@@ -1,8 +1,12 @@
-# NL2Prompt · 自然语言提示词
+# NL2Prompt · Natural Language Prompt
 
-**把一句人话变成可直接送进 K 采样器的提示词。**
+**Turn one sentence of plain language into a prompt that goes straight into KSampler.**
 
-输入「银发红瞳的少女站在雨夜霓虹街头，赛博朋克风格」，输出结构化的英文 tag 提示词 + 可直接连接的 `CONDITIONING`，同时自动注入你配置的角色 / 服装 / 画师 LoRA 触发词与权重。
+Type *"a silver-haired girl with red eyes on a rainy neon street, cyberpunk style"* — get a structured English tag prompt plus ready-to-connect `CONDITIONING`, with the trigger words and weights of your configured character / outfit / artist LoRAs injected automatically.
+
+<p>
+  <a href="README.md"><b>English</b></a> &nbsp;·&nbsp; <a href="README.zh-CN.md">简体中文</a>
+</p>
 
 <p>
 <img alt="license" src="https://img.shields.io/badge/license-AGPL--3.0-blue">
@@ -10,173 +14,173 @@
 <img alt="python" src="https://img.shields.io/badge/python-3.10%2B-yellow">
 </p>
 
-![完整工作流](docs/images/完整工作流.png)
+![Complete workflow](docs/images/完整工作流.png)
 
-*一句话 + 角色/风格 LoRA → 两路 `CONDITIONING` 直接进 KSampler，省掉两个 `CLIPTextEncode` 节点。*
-
----
-
-## 1. 它解决什么问题
-
-ComfyUI 里画一张「对的」图，通常要做三件事：**想提示词、拼 LoRA 触发词、拉一堆连线的编码节点**。这三件事都很碎：
-
-- 提示词要按模型偏好写成 tag 串，权重、括号、正负向都要对；
-- 角色 / 画师 LoRA 有各自的触发词，漏一个人物就走形；
-- `CLIPTextEncode` × 2 + `LoRA` 连线，工作流很快就成一团。
-
-NL2Prompt 把这三步收进一个节点：**写一句话，选好 LoRA，直接把线拉到采样器**。
-
-- 🎯 **提示词直连采样器** — 输出 `positive` / `negative` 两路 `CONDITIONING`，不用再连 `CLIPTextEncode`
-- 🤖 **可选 LLM 改写** — 本地 GGUF / 本地 safetensors / 34 家云端 API，三种后端任选；不接 LLM 也能用
-- 🎭 **LoRA 语义注入** — 角色、服装、画师三类 LoRA，自动带触发词和推荐权重
-- ⚙️ **独立设置面板** — 角色库、风格库、提示词技能、供应商密钥，都在一个窗口里管，不挤节点属性
-- 🌏 **中英双语** — 跟随 ComfyUI 语言自动切换，也可强制指定
+*One sentence + character/style LoRA → two `CONDITIONING` outputs straight into KSampler, saving two `CLIPTextEncode` nodes.*
 
 ---
 
-## 2. 功能特性
+## 1. What it solves
 
-### 2.1 提示词组装
+Getting the *right* image out of ComfyUI usually means doing three things at once: **writing the prompt, working out LoRA trigger words, and wiring up a pile of encoding nodes.** All three are fiddly:
 
-| 能力 | 说明 |
+- The prompt has to be a tag string tuned to the model, with weights, parentheses and positive/negative sides all correct;
+- Character and artist LoRAs each have their own trigger words — miss one and the character drifts;
+- `CLIPTextEncode` × 2 plus `LoRA` connections, and the workflow is a mess before you know it.
+
+NL2Prompt folds all three into a single node: **write a sentence, pick your LoRAs, drag the wires into the sampler.**
+
+- 🎯 **Prompt straight into the sampler** — outputs `positive` / `negative` `CONDITIONING`, no `CLIPTextEncode` needed
+- 🤖 **Optional LLM rewrite** — local GGUF / local safetensors / 34 cloud APIs; works fine without any LLM
+- 🎭 **Semantic LoRA injection** — character, outfit and artist LoRAs, each with trigger words and suggested weights
+- ⚙️ **Dedicated settings window** — character library, style library, prompt skills and provider keys all live in one window, not squeezed into node properties
+- 🌏 **Bilingual UI** — follows ComfyUI's language automatically, or force one
+
+---
+
+## 2. Features
+
+### 2.1 Prompt assembly
+
+| Capability | Description |
 |---|---|
-| 自然语言解析 | 中英文都认，提取人物、动作、场景、风格、镜头 |
-| 角色 / 服装 / 画师注入 | 按 `characters.json` / `styles.json` 的配置带触发词和权重 |
-| 正向 / 负向基础词 | 两端各有一段可配置的固定前缀（画质词、负面词），自动拼接 |
-| 权重语法 | 支持 `(tag:1.2)`，越界会给出提示 |
-| 确定性 | 支持 seed，同一输入 + 同 seed 结果稳定，便于复现 |
+| Natural language parsing | Accepts Chinese and English; extracts subject, action, scene, style, camera |
+| Character / outfit / artist injection | Uses trigger words and weights from `characters.json` / `styles.json` |
+| Positive / negative base words | Each side has a configurable fixed prefix (quality tags, negative tags), appended automatically |
+| Weight syntax | Supports `(tag:1.2)`; out-of-range values are flagged |
+| Determinism | Seed support — same input + same seed gives the same result, so runs are reproducible |
 
-**LoRA 注入是可选的、且拆成两半**：主节点只负责*算出该用哪些 LoRA*（输出 `lora_stack` 列表），真正加载由 **`LoRA 堆栈加载`** 节点完成 —— 它把每个 LoRA 依次打进 `MODEL` + `CLIP`，单个 LoRA 找不到或加载失败只打印一行日志然后跳过，**不会中断出图**。不接这个节点也能正常生成。
+**LoRA injection is optional, and it is split in two.** The main node only *works out which LoRAs to use* (the `lora_stack` output); the actual loading is done by the **`LoRA Stack Loader`** node, which applies each LoRA to `MODEL` + `CLIP` in order. If one LoRA is missing or fails to load, it logs a line and skips it — **without breaking the generation**. Skip that node entirely and everything still works.
 
-它还提供 `enabled` 一键旁路全部 LoRA、`strength_scale` 全局微调强度（0–2），不用逐个改权重。
+It also gives you `enabled` to bypass all LoRAs at once, and `strength_scale` to fine-tune every weight globally (0–2) instead of editing each one.
 
-![主节点正面](docs/images/转换器.png)
+![Main node face](docs/images/转换器.png)
 
-*主节点正面：左侧 3 个输入（`llm` / `clip` / `model`），右侧 8 个输出，中间是自然语言输入框、角色/风格 LoRA 行与「重写提示词」按钮。*
+*The main node: 3 inputs on the left (`llm` / `clip` / `model`), 8 outputs on the right, and in the middle the natural-language box, character/style LoRA rows and the rewrite button.*
 
-### 2.2 LLM 重写（可选）
+### 2.2 LLM rewrite (optional)
 
-三种后端，按你的硬件选：
+Three backends — pick one that matches your hardware:
 
-| 节点 | 后端 | 适用 |
+| Node | Backend | Good for |
 |---|---|---|
-| `NL2Prompt LLM (GGUF)` | llama.cpp / `llama-server.exe` | **推荐**。量化权重，12 GB 显存够跑 9B |
-| `NL2Prompt LLM (safetensors)` | HuggingFace transformers | 已有 transformers 格式权重、显存充裕时 |
-| `NL2Prompt LLM (Cloud)` | 任意 OpenAI 兼容 API | 没有本地算力，或想要更强的模型 |
+| `NL2Prompt LLM (GGUF)` | llama.cpp / `llama-server.exe` | **Recommended.** Quantised weights; a 9B model fits in 12 GB |
+| `NL2Prompt LLM (safetensors)` | HuggingFace transformers | You already have transformers-format weights and have VRAM to spare |
+| `NL2Prompt LLM (Cloud)` | Any OpenAI-compatible API | No local compute, or you want a stronger model |
 
-云端部分内置 34 家供应商预设，填 API Key 即可用；也可以自己填 `base_url` 和模型名，接入任何兼容接口。
+The cloud side ships with **34 provider presets** — drop in an API key and go. You can also fill in `base_url` and a model name yourself to reach any compatible endpoint.
 
-![六种 LLM 节点形态](docs/images/加载LLM.png)
+![Six LLM node shapes](docs/images/加载LLM.png)
 
-*三种拆分节点（GGUF / safetensors / Cloud）+ 合并版按 `model_type` 切换出的三种形态。合并版一个节点即可覆盖本地与云端，旧工作流不会失效。*
+*Three split nodes (GGUF / safetensors / Cloud) plus the three shapes the merged node switches between via `model_type`. One merged node can cover local and cloud, so old workflows keep working.*
 
-其他 LLM 相关能力：
+Other LLM-related features:
 
-- **多轮历史** — 保留最近 20 轮对话，可以「接着上一版改」
-- **质量评分** — 对生成结果打分，低分自动重试一次
-- **提示词技能（skill）** — 可插拔的提示词工程规范文件，控制 LLM 的输出格式与自检项；支持导入、导出、新建、删除
-- **自动卸载** — 设一次 `unload_after_use`，重写完成后自动释放本地模型占用的显存
-- **思考模式开关** — 对 reasoning 模型可关闭思维链，省 token 也更快
+- **Multi-turn history** — keeps the last 20 turns so you can iterate ("change it from the previous version")
+- **Quality scoring** — scores the result and retries once if it falls short
+- **Prompt skills** — pluggable prompt-engineering spec files that control the LLM's output format and self-checks; import, export, create, delete
+- **Auto-unload** — set `unload_after_use` once and the local model's VRAM is released after the rewrite
+- **Thinking toggle** — turn off the chain of thought on reasoning models to save tokens and time
 
-### 2.3 设置面板
+### 2.3 Settings window
 
-独立浮窗（不是节点属性），位于主节点正面底部的 Settings 按钮。**7 个标签页**：
+A standalone floating window (not node properties), opened from the **Settings** button at the bottom of the main node. **7 tabs**:
 
-| 标签页 | 内容 |
+| Tab | Contents |
 |---|---|
-| General | 界面语言、全局默认正面基础词 |
-| Replacements | 文字替换规则（一个词换成另一个词） |
-| System prompt | 传给 LLM 的系统提示词 |
-| Positive base | 正面基础词（默认前缀） |
-| Negative base | 负面基础词（默认负向前缀） |
-| Skills | 提示词技能的查看 / 编辑 / 导入导出 / 新建删除 |
-| History | 多轮对话历史（最近 20 轮，可沿用上一轮结果） |
+| General | Interface language, global default positive base |
+| Replacements | Text substitution rules (one word → another) |
+| System prompt | The system prompt handed to the LLM |
+| Positive base | Positive base words (default prefix) |
+| Negative base | Negative base words (default negative prefix) |
+| Skills | View / edit / import / export / create / delete prompt skills |
+| History | Multi-turn conversation history (last 20, can reuse the previous round) |
 
-![设置面板 · General](docs/images/设置1.png)
+![Settings · General](docs/images/设置1.png)
 
-*七个标签页全在这里；`Interface language` 可即时切换中英，不用重启。*
+*All seven tabs; `Interface language` switches Chinese/English instantly, no restart needed.*
 
-LLM 节点另有自己的设置窗口（Sampling / Cloud model / Local settings），见 5.3。
+LLM nodes have their own settings window (Sampling / Cloud model / Local settings) — see 5.3.
 
-### 2.4 双语界面
+### 2.4 Bilingual UI
 
-界面文案中英双语，**330 个键位**全覆盖。语言可跟随 ComfyUI 主界面，也可强制指定。
+The interface is bilingual with **330 keys** fully covered. The language can follow ComfyUI or be forced.
 
-切换语言时以下内容**即时同步，无需刷新页面**：
+Switching language updates all of the following **instantly, with no page reload**:
 
-- 左侧节点栏里的节点显示名
-- 节点标题、以及鼠标悬停在节点上出现的描述
-- 下拉选项（如 `model_type`、`model_file` 的占位项）
-- 供应商显示名（英文界面用品牌名，如 `DeepSeek` 而非「深度求索」）
-- 面板与设置窗口内的全部文案
+- Node display names in the left-hand node library
+- Node titles, and the description shown when you hover over a node
+- Dropdown options (e.g. `model_type`, the `model_file` placeholder)
+- Provider display names (English uses brand names, `DeepSeek` rather than 「深度求索」)
+- Every string in panels and settings windows
 
-> ComfyUI 自身的语言（原生节点名、右键菜单）由 ComfyUI 的设置控制，与本插件的语言设置**相互独立**。想两边一致，需要在 ComfyUI 设置里也切一次。
+> ComfyUI's own language (native node names, context menus) is controlled by ComfyUI's settings and is **independent** of this plugin's language setting. To make both match, switch ComfyUI's locale too.
 
 ---
 
-## 3. 安装
+## 3. Installation
 
-### 3.1 放进 ComfyUI
+### 3.1 Into ComfyUI
 
 ```bash
-cd <你的ComfyUI>/custom_nodes
+cd <your ComfyUI>/custom_nodes
 git clone https://github.com/GQLI-VC/NL2Prompt.git nl2prompt
 ```
 
-或者直接把这个目录整个复制进 `custom_nodes/`，重命名为 `nl2prompt`。
+Or just copy this whole directory into `custom_nodes/` and rename it to `nl2prompt`.
 
-### 3.2 依赖
+### 3.2 Dependencies
 
-**核心功能不需要装任何第三方包**，插件只用 ComfyUI 自带的 `torch` / `numpy` / `aiohttp`。
+**Core features need no third-party packages.** The plugin only uses what ComfyUI already ships: `torch` / `numpy` / `aiohttp`.
 
-只有 **本地 safetensors 模式**需要额外依赖：
+Only **local safetensors mode** needs anything extra:
 
 ```bash
-<你的ComfyUI>/python_embeded/python.exe -m pip install transformers accelerate
+<your ComfyUI>/python_embeded/python.exe -m pip install transformers accelerate
 ```
 
-GGUF 模式与云端模式都不需要这些。详见 [requirements.txt](requirements.txt)。
+GGUF mode and cloud mode need none of it. See [requirements.txt](requirements.txt).
 
-### 3.3 重启
+### 3.3 Restart
 
-重启 ComfyUI，在节点栏里搜索 `NL2Prompt` 即可看到 6 个节点。
+Restart ComfyUI and search for `NL2Prompt` in the node library — you should see 6 nodes.
 
 ---
 
-## 4. 快速开始
+## 4. Quick start
 
-`workflows/` 目录里有可直接导入的示例工作流：
+`workflows/` contains ready-to-import example workflows:
 
-| 文件 | 说明 |
+| File | Description |
 |---|---|
-| `NL2Prompt_v3_Direct.workflow.json` | **推荐**。8 节点精简版：`CONDITIONING` 直接进 KSampler |
-| `NL2Prompt_WithLoRA.workflow.json` | 带 LoRA 堆叠的完整流程（角色 / 画师 LoRA） |
-| `NL2Prompt_MVP.workflow.json` | 最小可用流程（兼容 v1/v2 的 `CLIPTextEncode` 接法） |
+| `NL2Prompt_v3_Direct.workflow.json` | **Recommended.** 8-node minimal version: `CONDITIONING` straight into KSampler |
+| `NL2Prompt_WithLoRA.workflow.json` | Full flow with the LoRA stack (character / artist LoRAs) |
+| `NL2Prompt_MVP.workflow.json` | Minimal flow compatible with v1/v2's `CLIPTextEncode` wiring |
 
-> 精简版里没有 LoRA 节点。需要角色或画师 LoRA 时，加一个 **`LoRA 堆栈加载`** 节点：把 `自然语言提示词` 的 `lora_stack` 输出接进它，再把它的 `model` 接到 KSampler、`clip` 接回 `自然语言提示词`。
+> The minimal version has no LoRA node. When you need character or artist LoRAs, add a **`LoRA Stack Loader`**: feed it the `lora_stack` output of the prompt node, then connect its `model` to KSampler and its `clip` back into the prompt node.
 
-拖进 ComfyUI 画布后，按下图接线即可：
+Drag one onto the canvas and wire it up like this:
 
 ```
-【加载CLIP】── CLIP ──┐
-                      ├─→【NL2Prompt 自然语言提示词】
-【LoRA 堆栈加载】─ CLIP┘        │
-                                ├─ positive_cond ──→【K采样器】positive
-                                ├─ negative_cond ──→【K采样器】negative
-                                └─ model ─────────→【K采样器】model（可选）
+【Load CLIP】── CLIP ──┐
+                       ├─→【NL2Prompt Natural Language Prompt】
+【LoRA Stack Loader】─ CLIP┘        │
+                                    ├─ positive_cond ──→【KSampler】positive
+                                    ├─ negative_cond ──→【KSampler】negative
+                                    └─ model ─────────→【KSampler】model (optional)
 ```
 
-也可以只取 `positive` / `negative` 两路文本，自己接 `CLIPTextEncode`（兼容老工作流）。
+You can also take just the `positive` / `negative` strings and feed your own `CLIPTextEncode` (keeps older workflows working).
 
-想要 LLM 改写的效果，把 `加载LLM` 节点接进主节点的 `llm` 输入即可；不接就是纯规则组装，一样能用。
+For the LLM rewrite, connect a `Load LLM` node to the main node's `llm` input. Without it you get pure rule-based assembly, which works just as well.
 
 ---
 
-## 5. 配置
+## 5. Configuration
 
-首次运行会自动生成 `plugin/data/settings.json` 与 `plugin/data/characters.json`。参考 [settings.example.json](plugin/data/settings.example.json)。
+First run generates `plugin/data/settings.json` and `plugin/data/characters.json`. See [settings.example.json](plugin/data/settings.example.json).
 
-### 5.1 角色库 / 风格库
+### 5.1 Character / style libraries
 
 `plugin/data/characters.json`
 
@@ -185,9 +189,9 @@ GGUF 模式与云端模式都不需要这些。详见 [requirements.txt](require
   "schema": 1,
   "characters": [
     {
-      "name": "角色名",
-      "triggers": ["触发词1", "触发词2"],
-      "lora": "角色LoRA的文件名.safetensors",
+      "name": "character name",
+      "triggers": ["trigger1", "trigger2"],
+      "lora": "your-character-lora.safetensors",
       "weight": 0.9,
       "clip_weight": 0.9
     }
@@ -195,129 +199,129 @@ GGUF 模式与云端模式都不需要这些。详见 [requirements.txt](require
 }
 ```
 
-`plugin/data/styles.json` 结构相同，字段换成画师 / 风格。两者在设置面板里都能直接增删改，不用手写 JSON。
+`plugin/data/styles.json` has the same structure with artist / style fields. Both can be edited in the settings window — no need to hand-write JSON.
 
-### 5.2 本地模型
+### 5.2 Local models
 
-节点正面有两个字段：
+Two fields on the node face:
 
-- **`model_path`**（GGUF 形态）/ **`model_dir`**（safetensors 形态）— 模型根目录，填好后点节点上的 **Refresh model list** 扫描出 `model_file` 下拉
-- **`gpu`** — 物理 GPU（`nvidia-smi` 枚举），双卡机器建议把 LLM 绑到副卡，主卡留给出图
+- **`model_path`** (GGUF shape) / **`model_dir`** (safetensors shape) — the model root; fill it in, then click **Refresh model list** to populate the `model_file` dropdown
+- **`gpu`** — physical GPU (enumerated by `nvidia-smi`). On a dual-GPU machine, bind the LLM to the secondary card and leave the primary for image generation
 
-`llama-server.exe` 的路径在**插件全局设置**里配（不是每个节点），见 `settings.json` 的 `llama_server_path`。
+The `llama-server.exe` path lives in the **plugin's global settings** (not per node) — see `llama_server_path` in `settings.json`.
 
-点节点上的 **Settings** 打开 LLM 设置窗口，**Local settings** 页可调上下文长度与超时：
+Click **Settings** on the node to open the LLM settings window; the **Local settings** page controls context length and timeout:
 
-![LLM 设置 · Local settings](docs/images/本地LLM设置.png)
+![LLM settings · Local settings](docs/images/本地LLM设置.png)
 
-### 5.3 云端 API Key
+### 5.3 Cloud API key
 
-LLM 节点的 **Settings → Cloud model**：选供应商 → 填 Key → 点 **Fetch models** 拉取该服务端可用模型 → 选中即可。
+LLM node → **Settings → Cloud model**: pick a provider → fill in the key → click **Fetch models** to pull the models that endpoint offers → select one.
 
-![LLM 设置 · Cloud model](docs/images/云端LLM设置.png)
+![LLM settings · Cloud model](docs/images/云端LLM设置.png)
 
-密钥只保存在本地 `plugin/data/secrets.json`，已列入 `.gitignore`，不会进入工作流、也不会写进日志。
+Keys are stored only in the local `plugin/data/secrets.json`, which is listed in `.gitignore`. They never enter the workflow and are never written to logs.
 
-### 5.4 采样参数
+### 5.4 Sampling parameters
 
-同一窗口的 **Sampling** 页控制 LLM 的采样：Top K / Top P / Temperature / Max tokens / Seed。
+The **Sampling** page of the same window controls LLM sampling: Top K / Top P / Temperature / Max tokens / Seed.
 
-![LLM 设置 · Sampling](docs/images/整体LLM设置.png)
+![LLM settings · Sampling](docs/images/整体LLM设置.png)
 
-> `top_k` 是本地模型专属；多数云端 OpenAI 兼容接口不支持，插件会自动禁用该项。
+> `top_k` is local-model only. Most cloud OpenAI-compatible APIs do not support it, and the plugin disables the field automatically.
 
-### 5.5 该选哪种 LLM 模式
+### 5.5 Which LLM mode should I use?
 
-| 你的情况 | 建议 |
+| Your situation | Suggestion |
 |---|---|
-| 有 12 GB 以上显存、想要离线 | **GGUF**，量化后 9B 模型约 5.5 GB，最稳 |
-| 已有 HF 格式权重、显存 ≥ 16 GB | safetensors |
-| 显存小、或在云上跑 | 云端 |
-| 只是想拼提示词 | 不用接 LLM |
+| 12 GB+ VRAM and you want it offline | **GGUF** — a quantised 9B model is about 5.5 GB, the most reliable option |
+| You already have HF-format weights and 16 GB+ VRAM | safetensors |
+| Low VRAM, or running in the cloud | Cloud |
+| You just want prompt assembly | Skip the LLM entirely |
 
 ---
 
-## 6. 常见问题
+## 6. FAQ
 
-**Q：不接 LLM 能用吗？**
-能。规则引擎本身就负责提示词组装和 LoRA 注入，LLM 只是可选的「润色层」。
+**Q: Does it work without an LLM?**
+Yes. The rule engine handles prompt assembly and LoRA injection on its own; the LLM is an optional polishing layer.
 
-**Q：我的 12 GB 卡跑 safetensors 模式报 OOM？**
-这是预期内的。6B 的 safetensors 模型 fp16 至少需要约 14 GiB。请改用 GGUF 节点，量化后能压到 5.5 GB 左右。
+**Q: My 12 GB card runs out of memory in safetensors mode?**
+That's expected. A 6B safetensors model needs at least ~14 GiB in fp16. Switch to the GGUF node — quantised, it fits in roughly 5.5 GB.
 
-**Q：为什么节点栏里的节点名是中文/英文，和我设置的语言不一致？**
-ComfyUI 前端把节点显示名缓存在自己的 store 里。切换语言后若未同步，按 `F5` 刷新一次页面即可。
+**Q: Why is the node library showing Chinese/English when I set the other language?**
+ComfyUI's frontend caches node display names in its own store. If it hasn't caught up after a language switch, press `F5` to refresh.
 
-**Q：旧工作流打开后节点上的设置按钮不见了？**
-v3 改过节点类名，但保留了旧类名的注册。如果仍异常，请确认 `custom_nodes/nl2prompt` 是完整的一份，且没有和旧版目录同时存在。
+**Q: The Settings button on my old nodes disappeared?**
+v3 renamed node classes but kept the old names registered. If it still misbehaves, check that `custom_nodes/nl2prompt` is a single complete copy and that no older version directory sits alongside it.
 
-**Q：云端返回 `401`？**
-先在设置面板确认该供应商的 API Key 已填写。密钥为空时插件会给出「未配置密钥」的提示，而不是 `401`；如果你看到 `401`，说明 Key 已提交但被服务端判为无效。
+**Q: The cloud returns `401`?**
+First check in Settings that the provider's API key is actually filled in. With an empty key the plugin reports "key not configured" rather than `401`; a `401` means the key was submitted but the server rejected it.
 
-**Q：能在商业项目里用吗？**
-个人与内部使用免费。闭源产品或付费 SaaS 需要商业授权，见 [LICENSING.md](LICENSING.md)。
-
----
-
-## 7. 已知限制
-
-- **显存**：12 GB 显卡跑不动 6B 级 safetensors，请用 GGUF。
-- **权重校验**：`(tag:9.9)` 这类**嵌套**在括号里的越界权重不会被校验器拦下（只检查最外层）。
-- **供应商标签**：供应商名称在英文界面下仍显示中文原名（品牌名不做翻译）。
-- **节点栏名称**：如前所述，极端情况下需刷新页面才会同步。
-- **LLM 质量**：改写效果取决于所选模型，小模型（≤3B）在复杂场景描述上仍可能丢细节。
+**Q: Can I use it commercially?**
+Personal and internal use is free. Closed-source products and paid SaaS require a commercial licence — see [LICENSING.md](LICENSING.md).
 
 ---
 
-## 8. 项目结构
+## 7. Known limitations
+
+- **VRAM** — a 12 GB card cannot run 6B-class safetensors. Use GGUF.
+- **Weight validation** — out-of-range weights **nested** inside parentheses, like `(tag:9.9)`, are not caught (only the outermost level is checked).
+- **Provider labels** — provider names stay in their original form in the English UI (brand names are not translated).
+- **Node library names** — as noted above, in rare cases a page refresh is needed to sync.
+- **LLM quality** — the rewrite depends on the model you pick; small models (≤3B) can still lose detail in complex scene descriptions.
+
+---
+
+## 8. Project structure
 
 ```
 nl2prompt/
-├── plugin/                     # 插件本体
-│   ├── __init__.py             # 节点注册、旧类名兼容
-│   ├── nodes.py                # 提示词组装 + LoRA 堆叠 + 旧版合并 LLM 节点
-│   ├── nodes_llm.py            # GGUF / safetensors / 云端 三种 LLM 节点
-│   ├── runtime.py              # llama-server 生命周期管理
-│   ├── llm_local_hf.py         # transformers 本地推理
-│   ├── llm_client.py           # 云端 API 调用
-│   ├── routes.py               # 后端 HTTP 路由
-│   ├── providers.py            # 34 家供应商定义（单一真源）
-│   ├── store.py                # 设置与数据持久化
-│   ├── skill_store.py          # 提示词技能管理
-│   ├── skill_check.py          # 技能输出校验
-│   ├── skills/                 # 内置技能文件
-│   ├── data/                   # 用户数据（角色/风格/设置，运行时生成）
-│   └── web/                    # 前端
-│       ├── i18n.js             # 中英文案
-│       ├── common.js           # 共用工具与设置窗口骨架
+├── plugin/                     # the plugin itself
+│   ├── __init__.py             # node registration, legacy class-name compatibility
+│   ├── nodes.py                # prompt assembly + LoRA stack + legacy merged LLM node
+│   ├── nodes_llm.py            # GGUF / safetensors / cloud LLM nodes
+│   ├── runtime.py              # llama-server lifecycle
+│   ├── llm_local_hf.py         # local inference via transformers
+│   ├── llm_client.py           # cloud API calls
+│   ├── routes.py               # backend HTTP routes
+│   ├── providers.py            # 34 provider definitions (single source of truth)
+│   ├── store.py                # settings and data persistence
+│   ├── skill_store.py          # prompt skill management
+│   ├── skill_check.py          # skill output validation
+│   ├── skills/                 # built-in skill files
+│   ├── data/                   # user data (characters/styles/settings, generated at runtime)
+│   └── web/                    # frontend
+│       ├── i18n.js             # zh/en strings
+│       ├── common.js           # shared utilities and settings-window scaffolding
 │       ├── nl2prompt_composer.js
 │       └── nl2prompt_load_llm.js
-├── workflows/                  # 示例工作流（v3 直连 / 带 LoRA / MVP 兼容）
-├── tests/                      # 自动化测试
-├── tools/                      # 开发与校验工具
-├── docs/                       # 文档（接口契约、开发记录、截图）
-├── LICENSE                     # AGPL-3.0 全文
-├── LICENSING.md                # 双许可说明
-├── LICENSE-COMMERCIAL.md       # 商业授权模板
+├── workflows/                  # example workflows (v3 direct / with LoRA / MVP compatible)
+├── tests/                      # automated tests
+├── tools/                      # development and verification tools
+├── docs/                       # documentation (interface contract, dev notes, screenshots)
+├── LICENSE                     # full AGPL-3.0 text
+├── LICENSING.md                # dual-licensing explanation
+├── LICENSE-COMMERCIAL.md       # commercial licence template
 ├── CHANGELOG.md
 └── requirements.txt
 ```
 
 ---
 
-## 9. 许可证
+## 9. License
 
-本项目采用 **AGPL-3.0 + 商业双许可**：
+This project is **dual-licensed: AGPL-3.0 + commercial**:
 
-| 场景 | 许可 |
+| Your situation | License |
 |---|---|
-| 个人使用、学习、内部工具 | **免费**（AGPL-3.0） |
-| 开源项目集成 | **免费**（需同样以 AGPL-3.0 发布） |
-| 闭源产品 / 付费 SaaS | **需商业授权** |
+| Personal use, learning, internal tooling | **Free** (AGPL-3.0) |
+| Integrating into an open-source project | **Free** (must also be released under AGPL-3.0) |
+| Closed-source product / paid SaaS | **Commercial licence required** |
 
-基于本项目代码修改后分发，必须保留版权声明、标注修改，并以同一许可发布（AGPL-3.0 §5）。通过网络提供服务同样触发源码开放义务（§13）。
+If you distribute a modified version, you must keep the copyright notice, mark the changed files and release under the same licence (AGPL-3.0 §5). Offering it as a network service triggers the same source-release obligation (§13).
 
-完整说明见 [LICENSING.md](LICENSING.md)，许可证全文见 [LICENSE](LICENSE)。
+Full explanation in [LICENSING.md](LICENSING.md); licence text in [LICENSE](LICENSE).
 
 ```
 Copyright (C) 2026 GQLI-VC
@@ -325,23 +329,23 @@ Copyright (C) 2026 GQLI-VC
 
 ---
 
-## 10. 致谢
+## 10. Acknowledgements
 
-本项目的**界面交互范式**参考了以下两个 ComfyUI 插件，它们的思路很有价值：
+The **UI interaction patterns** here were inspired by two other ComfyUI plugins, both of which are worth a look:
 
-- [nregret/Comfyui-Anima-Tools](https://github.com/nregret/Comfyui-Anima-Tools)（MIT，声明于 `pyproject.toml`）— 提示词双栏编辑的交互设计
-- [n0va39/ComfyUI-EasyUseAnima](https://github.com/n0va39/ComfyUI-EasyUseAnima)（GPL-3.0）— 独立设置浮窗的组织方式
+- [nregret/Comfyui-Anima-Tools](https://github.com/nregret/Comfyui-Anima-Tools) (MIT, declared in `pyproject.toml`) — the two-column prompt editing layout
+- [n0va39/ComfyUI-EasyUseAnima](https://github.com/n0va39/ComfyUI-EasyUseAnima) (GPL-3.0) — the standalone settings-window approach
 
-**本项目未复制任何上述项目的代码**。经逐行比对（3–5 行滑动窗口 n-gram 检测），代码块重合数为 0，唯一标识符交集为空。仅借鉴了「隐藏占位控件 + 独立设置浮窗」这类通用设计模式，而设计模式不受著作权保护。详见 [LICENSING.md §4](LICENSING.md)。
+**No code from either project was copied.** A line-by-line comparison (3–5 line sliding-window n-gram detection) found zero matching blocks and an empty intersection of unique identifiers. Only general design patterns were borrowed — a hidden holder widget and a standalone settings dialog — and design patterns are not copyrightable. Details in [LICENSING.md §4](LICENSING.md).
 
-同时感谢 ComfyUI 社区与 llama.cpp 项目。
+Thanks also to the ComfyUI community and the llama.cpp project.
 
 ---
 
-## 11. 关于本文档
+## 11. About this document
 
-本文档（含 README、CHANGELOG 与 `docs/` 下的说明）由 **AI 辅助撰写**，并经过人工核对与实测验证——文中所有截图均截自插件的真实运行界面，功能描述有对应的自动化测试覆盖。
+This document (the README, CHANGELOG and everything under `docs/`) was **written with AI assistance** and then reviewed and verified by hand — every screenshot is taken from the plugin actually running, and the feature descriptions are backed by automated tests.
 
-但界面布局、默认值、参数名可能随版本演进发生调整，**实际效果请以插件在你的 ComfyUI 中运行的结果为准**。如果发现文档与实机不符，欢迎提 [Issue](https://github.com/GQLI-VC/NL2Prompt/issues) 指正——这类反馈对项目尤其有价值。
+That said, UI layout, defaults and parameter names can shift between versions. **What actually matters is how the plugin behaves in your own ComfyUI** — treat the running instance as the source of truth. If you find the docs disagree with reality, please [open an issue](https://github.com/GQLI-VC/NL2Prompt/issues); that kind of feedback is especially valuable.
 
-> 验证安装是否成功最快的办法：直接拖入 `workflows/NL2Prompt_v3_Direct.workflow.json` 跑一遍。
+> The fastest way to check that installation worked: drag in `workflows/NL2Prompt_v3_Direct.workflow.json` and run it.
