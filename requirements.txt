@@ -1,0 +1,26 @@
+# NL2Prompt — dependencies
+#
+# ── Hard requirements: NONE ────────────────────────────────────────────────
+# The plugin imports only what ComfyUI already installs for you:
+#   torch, numpy, aiohttp  (plus the Python standard library)
+# Install nothing extra and all of these work:
+#   - 提示词组装 (prompt assembly, no LLM)
+#   - 云端模型 (cloud LLM, any OpenAI-compatible API)
+#   - GGUF 本地模型 (local GGUF via llama.cpp / llama-server)
+#
+# ── Optional: local safetensors LLM mode ───────────────────────────────────
+# Only the "NL2Prompt LLM (safetensors)" node needs these. They are heavy
+# (~2-3 GB with CUDA wheels cached) and are NOT needed for any other mode.
+# Uncomment to install:
+#
+# transformers>=4.46
+# accelerate>=1.0
+# safetensors>=0.4
+# huggingface_hub>=0.26
+#
+# Install into ComfyUI's own Python environment, e.g.
+#   <ComfyUI>/python_embeded/python.exe -m pip install transformers accelerate
+#
+# Note: on a 12 GB GPU, multi-billion-parameter safetensors models will run
+# out of memory. Use the GGUF node instead — it quantises weights and fits far
+# smaller. See "已知限制" in README.md.

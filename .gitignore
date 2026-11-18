@@ -1,0 +1,36 @@
+# ---- 本机配置与运行时产物（含本机绝对路径 / 密钥，禁止入库）----
+plugin/data/settings.json
+plugin/data/secrets.json
+plugin/data/logs/
+plugin/data/*.log
+
+# ---- 测试探针自动生成的证据文件 ----
+tests/_*
+
+# ---- Python ----
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# ---- 隔离测试环境（可重建，体积大）----
+test_env/
+
+# ---- 模型权重（体积大，不入库）----
+*.gguf
+*.safetensors
+*.ckpt
+*.pt
+*.bin
+
+# ---- 出图产物与临时文件 ----
+output/
+.tmp/
+*.tmp
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,187 @@
+{
+  "prompt": {
+    "1": {
+      "class_type": "UNETLoader",
+      "inputs": {
+        "unet_name": "anima-preview3-base.safetensors",
+        "weight_dtype": "default"
+      },
+      "_meta": {
+        "title": "UNET加载（Anima 主模型）"
+      }
+    },
+    "2": {
+      "class_type": "CLIPLoader",
+      "inputs": {
+        "clip_name": "Qwen3-06B-Base.safetensors",
+        "type": "stable_diffusion",
+        "device": "default"
+      },
+      "_meta": {
+        "title": "CLIP加载（Qwen3-06B）"
+      }
+    },
+    "3": {
+      "class_type": "VAELoader",
+      "inputs": {
+        "vae_name": "qwen_image_vae.safetensors"
+      },
+      "_meta": {
+        "title": "VAE加载（qwen_image_vae）"
+      }
+    },
+    "4": {
+      "class_type": "NL2PromptComposer",
+      "inputs": {
+        "natural_language": "银发少女站在雨后的霓虹街道上",
+        "use_llm": false,
+        "_ui_json": "{\"schema\": 1, \"character_rows\": [], \"style_rows\": [], \"text_map\": [{\"id\": \"t1\", \"find\": \"霓虹街道\", \"prompt\": \"neon-lit street, rain, wet ground, night\", \"target\": \"positive\"}], \"system_prompt\": \"\", \"negative_base\": \"lowres, bad anatomy, bad hands, text, watermark, extra digits, worst quality, low quality\", \"sampling\": {\"seed\": -1}, \"ui\": {\"open_main_window\": false}}"
+      },
+      "_meta": {
+        "title": "自然语言提示词"
+      }
+    },
+    "5": {
+      "class_type": "CLIPTextEncode",
+      "inputs": {
+        "text": [
+          "4",
+          0
+        ],
+        "clip": [
+          "2",
+          0
+        ]
+      },
+      "_meta": {
+        "title": "正向提示词编码"
+      }
+    },
+    "6": {
+      "class_type": "CLIPTextEncode",
+      "inputs": {
+        "text": [
+          "4",
+          1
+        ],
+        "clip": [
+          "2",
+          0
+        ]
+      },
+      "_meta": {
+        "title": "负向提示词编码"
+      }
+    },
+    "7": {
+      "class_type": "NL2PromptLoRAStack",
+      "inputs": {
+        "model": [
+          "1",
+          0
+        ],
+        "clip": [
+          "2",
+          0
+        ],
+        "lora_stack": [
+          "4",
+          3
+        ],
+        "enabled": true,
+        "strength_scale": 1.0
+      },
+      "_meta": {
+        "title": "LoRA 堆栈加载"
+      }
+    },
+    "8": {
+      "class_type": "EmptyLatentImage",
+      "inputs": {
+        "width": 1024,
+        "height": 1024,
+        "batch_size": 1
+      },
+      "_meta": {
+        "title": "空 Latent 1024x1024"
+      }
+    },
+    "9": {
+      "class_type": "KSampler",
+      "inputs": {
+        "model": [
+          "7",
+          0
+        ],
+        "positive": [
+          "5",
+          0
+        ],
+        "negative": [
+          "6",
+          0
+        ],
+        "latent_image": [
+          "8",
+          0
+        ],
+        "seed": 123456789,
+        "steps": 24,
+        "cfg": 7.0,
+        "sampler_name": "euler_ancestral",
+        "scheduler": "normal",
+        "denoise": 1.0
+      },
+      "_meta": {
+        "title": "KSampler"
+      }
+    },
+    "10": {
+      "class_type": "VAEDecode",
+      "inputs": {
+        "samples": [
+          "9",
+          0
+        ],
+        "vae": [
+          "3",
+          0
+        ]
+      },
+      "_meta": {
+        "title": "VAE 解码"
+      }
+    },
+    "11": {
+      "class_type": "SaveImage",
+      "inputs": {
+        "images": [
+          "10",
+          0
+        ],
+        "filename_prefix": "NL2Prompt_MVP/NL_MVP"
+      },
+      "_meta": {
+        "title": "保存图像"
+      }
+    }
+  },
+  "extra_data": {
+    "ds_generator": "qa-integration/tests/gen_workflows.py",
+    "ds_title": "NL2Prompt MVP（纯自然语言 + 文字替换，无 LoRA）",
+    "ds_note": "可直接 POST http://127.0.0.1:8199/prompt（body 即本文件）",
+    "ds_models": {
+      "unet": "anima-preview3-base.safetensors",
+      "clip": "Qwen3-06B-Base.safetensors",
+      "vae": "qwen_image_vae.safetensors"
+    },
+    "ds_ksampler": {
+      "steps": 24,
+      "cfg": 7.0,
+      "sampler_name": "euler_ancestral",
+      "scheduler": "normal",
+      "denoise": 1.0,
+      "seed": 123456789
+    }
+  }
+}

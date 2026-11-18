@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "default": "anima-tag-master",
+  "skills": [
+    {
+      "id": "anima-tag-master",
+      "display_name": "Anima 标签大师",
+      "target_model": "anima",
+      "file": "anima-tag-master.json"
+    }
+  ]
+}

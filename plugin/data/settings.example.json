@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "llama_server_path": "",
+  "model_roots": [],
+  "default_negative_base": "lowres, bad anatomy, bad hands, text, watermark, extra digits, worst quality, low quality",
+  "default_positive_base": "",
+  "default_system_prompt": "",
+  "ui_locale": "auto",
+  "llm_local": {
+    "dtype": "fp16",
+    "unload_after_use": false
+  }
+}

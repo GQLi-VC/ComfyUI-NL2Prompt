@@ -1,0 +1,5 @@
+{
+  "schema": 1,
+  "_note": "风格数据（本文件的示例已清空，按下面格式自行填写）。带 lora_name 的风格必须指向真实存在的文件；纯画师标签风格把 lora_name 设为 null，靠 artist_tags 注入。",
+  "styles": []
+}

@@ -1,0 +1,17 @@
+# 统一换行符：ComfyUI 插件需在 Linux 上运行，一律用 LF
+* text=auto eol=lf
+
+# 二进制文件不做换行符转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.gguf binary
+*.safetensors binary
+*.ckpt binary
+*.pt binary
+*.bin binary
+*.zip binary
+*.7z binary
