@@ -340,6 +340,8 @@ Copyright (C) 2026 GQLI-VC
 
 同时感谢 ComfyUI 社区与 llama.cpp 项目。
 
+具体分工（人与 AI）见 [CONTRIBUTORS.md](CONTRIBUTORS.md)。
+
 ---
 
 ## 11. 关于本文档

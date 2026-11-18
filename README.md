@@ -340,6 +340,8 @@ The **UI interaction patterns** here were inspired by two other ComfyUI plugins,
 
 Thanks also to the ComfyUI community and the llama.cpp project.
 
+See [CONTRIBUTORS.md](CONTRIBUTORS.md) for who did what, human and AI.
+
 ---
 
 ## 11. About this document
