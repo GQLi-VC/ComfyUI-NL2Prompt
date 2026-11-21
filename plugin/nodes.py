@@ -189,6 +189,9 @@ def _load_sibling(name):
 _llm_client = _load_sibling("llm_client")
 _store_mod = _load_sibling("store")
 _providers_mod = _load_sibling("providers")
+# v5：danbooru 标签库访问层。模块导入时不打开数据库（惰性），
+# 缺失/损坏时 _load_sibling 返回 None，全链路自动跳过校验。
+_tagdb_mod = _load_sibling("tagdb")
 
 
 #: 统一异常类型：优先用 ``llm_client.LLMError``，缺失时用本地等价实现
@@ -1560,6 +1563,69 @@ def _extract_llm_result(parsed, core):
     return positive, negative, analysis
 
 
+def _option_bool(value, default):
+    """把配置开关归一成 bool；无法判断时回落 ``default``。
+
+    注意 ``bool("false")`` 在 Python 里是 ``True``，字符串必须单独判定。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("1", "true", "yes", "on", "开", "开启"):
+            return True
+        if text in ("0", "false", "no", "off", "关", "关闭"):
+            return False
+    return default
+
+
+#: ``prompt_opt`` 的默认值：**全开**（与 store.DEFAULT_PROMPT_OPT 保持一致）。
+PROMPT_OPT_DEFAULTS = {
+    "dedupe_skill": True,
+    "static_selected": True,
+    "retry_multiturn": True,
+}
+
+
+def _prompt_options():
+    """读取「提示词优化开关」，**任何异常都回落默认全开**。
+
+    硬要求（lead）：store 不可用 / 读失败 / 键缺失 / 类型错 —— 一律走默认全开。
+    **绝不能因为读配置失败就退化成「skill 双份注入」**（那会白烧约 45% token）。
+    """
+    module = _store_mod
+    if module is None:
+        return dict(PROMPT_OPT_DEFAULTS)
+    options = None
+    getter = getattr(module, "prompt_options", None)
+    if callable(getter):
+        try:
+            options = getter()
+        except Exception as exc:  # noqa: BLE001 - 读不到就用默认，绝不外抛
+            _log(f"prompt_options 读取失败，回落默认全开：{type(exc).__name__}: {exc}")
+            options = None
+    if not isinstance(options, dict):
+        # 兼容旧版 store（没有 prompt_options）：手工从 settings 里取
+        loader = getattr(module, "load_settings", None)
+        if callable(loader):
+            try:
+                settings = loader()
+                if isinstance(settings, dict):
+                    options = settings.get("prompt_opt")
+                    if isinstance(options, dict):
+                        options = dict(options)
+            except Exception:  # noqa: BLE001
+                options = None
+    if not isinstance(options, dict):
+        return dict(PROMPT_OPT_DEFAULTS)
+    return {
+        key: _option_bool(options.get(key, default), default)
+        for key, default in PROMPT_OPT_DEFAULTS.items()
+    }
+
+
 def _build_messages_for(config, core, natural_language, view, skill, forbidden_tokens=()):
     """统一构造 LLM messages（首次调用与重试共用，避免两套逻辑漂移）。
 
@@ -1593,9 +1659,12 @@ def _build_messages_for(config, core, natural_language, view, skill, forbidden_t
         and isinstance(skill.get("system_prompt"), str)
         and bool(skill.get("system_prompt").strip())
     )
+    # v5：去双份注入可由 ``settings.prompt_opt.dedupe_skill`` 关闭（仅用于对照排查）。
+    # 关闭时走改动前的老逻辑，恢复 skill 在 system 里出现两次的行为。
+    prompt_options = _prompt_options()
     if user_system_prompt:
         system_prompt = user_system_prompt
-    elif skill_has_prompt:
+    elif skill_has_prompt and prompt_options["dedupe_skill"]:
         system_prompt = ""
     else:
         system_prompt = _default_system_prompt()
@@ -1604,28 +1673,168 @@ def _build_messages_for(config, core, natural_language, view, skill, forbidden_t
     if not callable(build):
         raise LLMError(ERR_NOT_CONNECTED, "llm_client.build_messages 缺失")
 
+    # 参数按「新到旧」逐级兼容：旧版 llm_client 可能不认识较新的可选参数
+    attempts = (
+        {"skill": skill, "forbidden_tokens": forbidden_tokens,
+         "static_selected": prompt_options["static_selected"],
+         "dedupe_skill": prompt_options["dedupe_skill"]},
+        {"skill": skill, "forbidden_tokens": forbidden_tokens,
+         "static_selected": prompt_options["static_selected"]},
+        {"skill": skill, "forbidden_tokens": forbidden_tokens},
+        {"skill": skill},
+    )
+    last_error = None
+    for kwargs in attempts:
+        try:
+            return build(
+                system_prompt,
+                natural_language,
+                core["positive"],
+                core["negative"],
+                view.catalog(),
+                _build_selected(config),
+                **kwargs
+            )
+        except TypeError as exc:
+            last_error = exc
+    raise LLMError(ERR_NOT_CONNECTED, f"llm_client.build_messages 参数不兼容：{last_error}")
+
+
+def _tagdb_options(ui):
+    """读取标签库开关（缺字段用默认；绝不因缺字段改变行为）。
+
+    支持两种写法（holder 里任选其一；**子对象优先于顶层**，因为更具体）：
+
+    * ``{"tagdb_enabled": false, "tagdb_min_confidence": 0.9}``
+    * ``{"tagdb": {"enabled": false, "min_confidence": 0.9}}``
+
+    默认 **enabled=True**：DB 不存在时 ``tagdb.available()`` 为 False，
+    整条校验自动跳过，等价于关闭，所以默认开启是安全的。
+    """
+    source = ui if isinstance(ui, dict) else {}
+    section = source.get("tagdb")
+    section = section if isinstance(section, dict) else {}
+
+    def pick(top_key, sub_key, default):
+        for holder, key in ((section, sub_key), (source, top_key)):
+            if key in holder:
+                return holder.get(key)
+        return default
+
+    enabled = pick("tagdb_enabled", "enabled", True)
+    min_confidence = pick("tagdb_min_confidence", "min_confidence",
+                          _tagdb_default_confidence())
     try:
-        return build(
-            system_prompt,
-            natural_language,
-            core["positive"],
-            core["negative"],
-            view.catalog(),
-            _build_selected(config),
-            skill=skill,
-            forbidden_tokens=forbidden_tokens,
+        min_confidence = float(min_confidence)
+    except (TypeError, ValueError):
+        min_confidence = _tagdb_default_confidence()
+    if min_confidence < 0.0 or min_confidence > 1.0:
+        min_confidence = _tagdb_default_confidence()
+    return {"enabled": bool(enabled), "min_confidence": min_confidence}
+
+
+def _tagdb_default_confidence():
+    """取 tagdb 模块的默认替换阈值；模块不可用时用 0.85 兜底。"""
+    value = getattr(_tagdb_mod, "DEFAULT_MIN_CONFIDENCE", None)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.85
+
+
+def _tagdb_whitelist(core, skill):
+    """本次「插件自己拼进提示词的词」+ skill 质量词：一律免校验。
+
+    为什么需要：LoRA 触发词、角色/服装 activation_words、``@画师`` 标签、
+    ``masterpiece / best quality`` 等质量词都不在 danbooru 里，
+    不豁免会把它们误判成 unknown 甚至改写掉。
+    """
+    words = []
+    debug = core.get("debug") if isinstance(core, dict) else {}
+    debug = debug if isinstance(debug, dict) else {}
+
+    injected = debug.get("injected_triggers")
+    if isinstance(injected, (list, tuple)):
+        words.extend(str(item) for item in injected if item)
+    suppress_source = debug.get("negative_suppress_source")
+    if isinstance(suppress_source, dict):
+        for value in suppress_source.values():
+            if isinstance(value, (list, tuple)):
+                words.extend(str(item) for item in value if item)
+    # 模板正向串全部来自数据层（角色/服装/风格/LoRA），整体免校验
+    if isinstance(core, dict):
+        words.extend(_split_tokens(core.get("positive")))
+    if isinstance(skill, dict):
+        quality = skill.get("quality_tags")
+        if isinstance(quality, (list, tuple)):
+            words.extend(str(item) for item in quality if item)
+    return [word for word in words if word]
+
+
+def _apply_tagdb(positive, ui, core, skill):
+    """用 danbooru 标签库校验并归一正向提示词，返回 ``(text, debug)``。
+
+    **只做校验与归一，不做生成**：它保证标签真实存在、拼写正确、用标准名，
+    但「该画什么」仍由 LLM 决定。任何异常都降级为「原文不动」，绝不影响出图。
+    """
+    debug = {"enabled": True, "available": False, "applied": False}
+    try:
+        options = _tagdb_options(ui)
+        if not options["enabled"]:
+            return positive, {"enabled": False, "available": False,
+                              "applied": False, "reason": "disabled"}
+        if _tagdb_mod is None:
+            return positive, {"enabled": True, "available": False,
+                              "applied": False, "reason": "module_missing"}
+        available_fn = getattr(_tagdb_mod, "available", None)
+        if not callable(available_fn) or not available_fn():
+            reason = "db_unavailable"
+            status_fn = getattr(_tagdb_mod, "status", None)
+            if callable(status_fn):
+                try:
+                    info = status_fn()
+                    if isinstance(info, dict) and info.get("error"):
+                        reason = str(info["error"])
+                except Exception:  # noqa: BLE001
+                    pass
+            return positive, {"enabled": True, "available": False,
+                              "applied": False, "reason": reason}
+
+        normalize = getattr(_tagdb_mod, "normalize_text", None)
+        if not callable(normalize):
+            return positive, {"enabled": True, "available": False,
+                              "applied": False, "reason": "normalize_text_missing"}
+
+        summary = normalize(
+            positive,
+            whitelist=_tagdb_whitelist(core, skill),
+            min_conf=options["min_confidence"],
         )
-    except TypeError:
-        # 旧版 llm_client 不支持 forbidden_tokens（并行开发期兼容）
-        return build(
-            system_prompt,
-            natural_language,
-            core["positive"],
-            core["negative"],
-            view.catalog(),
-            _build_selected(config),
-            skill=skill,
-        )
+        if not isinstance(summary, dict):
+            return positive, {"enabled": True, "available": True,
+                              "applied": False, "reason": "bad_result"}
+        if summary.get("skipped"):
+            return positive, {"enabled": True, "available": True,
+                              "applied": False,
+                              "reason": _s(summary.get("reason")) or "skipped"}
+
+        text = summary.get("text")
+        text = text if isinstance(text, str) and text.strip() else positive
+        return text, {
+            "enabled": True,
+            "available": True,
+            "applied": text != positive,
+            "min_confidence": options["min_confidence"],
+            "corrected": summary.get("corrected") or [],
+            "suggestions": summary.get("suggestions") or [],
+            "unknown": summary.get("unknown") or [],
+            "stats": summary.get("stats") or {},
+            "unknown_ratio": summary.get("unknown_ratio", 0.0),
+        }
+    except Exception as exc:  # noqa: BLE001 - 标签库只是增强功能，绝不拖垮出图
+        _log(f"tagdb 校验异常（已跳过，提示词保持原样）：{type(exc).__name__}: {exc}")
+        debug["reason"] = "internal_error"
+        return positive, debug
 
 
 def _merge_suppress_into_negative(llm_negative, forbidden_tokens, template_negative=""):
@@ -1959,6 +2168,9 @@ def _rewrite_only(llm, natural_language, ui, data=None, core=None):
     skill_id = _s(config["ui"].get("skill_id")) or DEFAULT_SKILL_ID
     skill = _load_skill(skill_id)
 
+    # v5：提示词优化开关（全开为默认；读失败也全开，绝不退化成双份注入）
+    prompt_options = _prompt_options()
+
     # ---- 本次注入约束（契约 §14.2 校验输入）
     required_tokens = list(core["debug"].get("injected_triggers") or [])
     forbidden_tokens = list(
@@ -1988,6 +2200,11 @@ def _rewrite_only(llm, natural_language, ui, data=None, core=None):
         _log(f"LLM 意外错误：{traceback.format_exc(limit=3)}")
         return fail("llm_unexpected_error", f"{type(exc).__name__}: {exc}")
 
+    # v5 阶段 2：danbooru 标签库校验与归一（**只校验不生成**）。
+    # 放在强制并入抑制词之前，让后面的校验看到的就是最终值。
+    # 任何失败都降级为「原文不动」，只记录 debug.tagdb。
+    positive, tagdb_debug = _apply_tagdb(positive, ui, core, skill)
+
     # 契约 §14.2（lead 裁决）：**强制并入**模板的 outfit 抑制词，不依赖 LLM 自觉。
     # 必须在 check_anima 之前，让校验看到的就是最终值。
     negative, negative_missing = _merge_suppress_into_negative(
@@ -2000,15 +2217,27 @@ def _rewrite_only(llm, natural_language, ui, data=None, core=None):
     if not check.get("ok", True):
         # 契约 §14.2：带 issues 重试 **1 次**
         #
-        # v4 优化：改成**多轮追加**（[system, user, assistant, user]），
-        # 直接复用首次的 first_messages，system 前缀逐字节不变 ->
-        # 服务端 prompt cache 可命中，不再重复计算 4.5k+1.1k 字符的 skill 全文。
+        # v4 优化（可由 settings.prompt_opt.retry_multiturn 关闭）：
+        # 默认改成**多轮追加**（[system, user, assistant, user]），直接复用首次的
+        # first_messages，system 前缀逐字节不变 -> 服务端 prompt cache 可命中，
+        # 不再重复计算 4.5k+1.1k 字符的 skill 全文。
         retried = True
-        retry_messages = _build_retry_messages(
-            first_messages,
-            _retry_assistant_text(parsed),
-            check.get("issues") or [],
-        )
+        if prompt_options["retry_multiturn"]:
+            retry_messages = _build_retry_messages(
+                first_messages,
+                _retry_assistant_text(parsed),
+                check.get("issues") or [],
+            )
+        else:
+            # 老路径（v3 及以前）：从头重建 messages，把 issues 拼到 user 末尾。
+            # 仅在 prompt_opt.retry_multiturn=false 时使用，用于 A/B 对照排查。
+            _log("prompt_opt.retry_multiturn=false，重试退回重建 messages 的老路径")
+            retry_messages = _append_retry_issues(
+                _build_messages_for(
+                    config, core, natural_language, view, skill, forbidden_tokens
+                ),
+                check.get("issues") or [],
+            )
         try:
             positive2, negative2, analysis2, extra2, parsed2 = _call_llm_once(
                 natural_language,
@@ -2043,6 +2272,9 @@ def _rewrite_only(llm, natural_language, ui, data=None, core=None):
                     "negative_missing": negative_missing,
                 },
             )
+
+        # 重试结果同样先过标签库校验（与首轮对称），再强制合并抑制词
+        positive2, tagdb_debug = _apply_tagdb(positive2, ui, core, skill)
 
         # 重试结果同样强制合并抑制词
         negative2, negative_missing2 = _merge_suppress_into_negative(
@@ -2082,6 +2314,7 @@ def _rewrite_only(llm, natural_language, ui, data=None, core=None):
             skill_check=skill_check_debug,
             quality=_run_quality(positive, negative, skill),
             analysis=analysis,
+            tagdb=tagdb_debug,
         )
 
     quality = _run_quality(positive, negative, skill)
@@ -2094,6 +2327,10 @@ def _rewrite_only(llm, natural_language, ui, data=None, core=None):
         "quality": quality,
         "analysis": analysis,
         "retried": retried,
+        # v5：标签库校验观测项（corrected / suggestions / unknown / stats / unknown_ratio）
+        "tagdb": tagdb_debug,
+        # v5：本轮生效的提示词优化开关（便于对照排查）
+        "prompt_opt": prompt_options,
     }
     debug.update(extra)
     return {

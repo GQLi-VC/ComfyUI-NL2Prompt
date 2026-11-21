@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 GQLI-VC
 // 加载LLM（NL2PromptLoadLLM）—— 节点正面 UI 与 LLM 设置窗口（v2）。
 //
 // 契约：docs/接口契约.md §2（节点 IO）、§4 / §14.4（holder schema）、§6 / §14.3（路由）、

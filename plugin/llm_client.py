@@ -22,6 +22,7 @@ import importlib
 import importlib.util
 import json
 import os
+import re
 import socket
 import sys
 import time
@@ -250,6 +251,137 @@ def _content_to_text(content):
     return ""
 
 
+#: thinking 模型把输出放在这些字段里（content 恒为空）。
+#: Qwen3 / Qwen3.5 用 ``reasoning_content``，部分端点是 ``reasoning`` / ``thinking``。
+_REASONING_KEYS = ("reasoning_content", "reasoning", "reasoning_text", "thinking")
+
+#: 从思考文本里找代码块（```json ... ```）。
+_FENCE_RE = re.compile(r"```(?:json)?\s*(.+?)```", re.S)
+
+
+def _reasoning_to_text(message):
+    """取出 thinking 模型的思考文本；没有则返回空串。"""
+    if not isinstance(message, dict):
+        return ""
+    for key in _REASONING_KEYS:
+        value = message.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+        text = _content_to_text(value)
+        if text.strip():
+            return text
+    return ""
+
+
+def _extract_json_block(text):
+    """从任意文本里提取「含 positive 键的 JSON 对象」原文。
+
+    优先取 fenced code block，其次扫全文的平衡 ``{...}``；
+    命中多个时取**最后一个**（thinking 过程里常先出草稿、最后才出终稿）。
+    找不到返回空串。
+    """
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    candidates = []
+    try:
+        for match in _FENCE_RE.finditer(text):
+            body = match.group(1).strip()
+            if body:
+                candidates.append(body)
+    except Exception:  # noqa: BLE001 - 正则异常不影响主流程
+        pass
+    candidates.append(text)
+
+    best = ""
+    for candidate in candidates:
+        depth = 0
+        start = -1
+        for index, char in enumerate(candidate):
+            if char == "{":
+                if depth == 0:
+                    start = index
+                depth += 1
+            elif char == "}":
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0 and start >= 0:
+                        block = candidate[start:index + 1]
+                        try:
+                            parsed = json.loads(block)
+                        except (ValueError, TypeError):
+                            continue
+                        if isinstance(parsed, dict) and isinstance(parsed.get("positive"), str):
+                            best = block
+        if best:
+            break
+    return best
+
+
+def _empty_content_detail(envelope, thinking_disabled=False):
+    """``content`` 为空时给出可诊断的错误详情。
+
+    最常见的坑：**thinking 模型未关闭思考**（Qwen3 / Qwen3.5 / DeepSeek-R1 等），
+    全部输出跑进 ``reasoning_content`` 且把 max_tokens 吃光，``finish_reason=length``，
+    于是 ``content`` 恒为空 —— 模型其实在工作，插件却报 ``llm_bad_json``。
+
+    :param thinking_disabled: 本次请求是否已经发了 ``reasoning_effort: "none"``，
+        决定提示语是「已尝试关闭思考」还是「没能关闭思考」。
+    """
+    hints = []
+    try:
+        choices = envelope.get("choices") if isinstance(envelope, dict) else None
+        first = choices[0] if isinstance(choices, list) and choices else {}
+        first = first if isinstance(first, dict) else {}
+        message = first.get("message")
+        message = message if isinstance(message, dict) else {}
+        reasoning = _reasoning_to_text(message)
+        finish = ""
+        try:
+            finish = str(first.get("finish_reason") or "").strip()
+        except Exception:
+            finish = ""
+        if reasoning:
+            block = _extract_json_block(reasoning)
+            if block and finish == "length":
+                hints.append(
+                    "reasoning 里有 JSON，但输出被截断（finish_reason=length），"
+                    "已拒绝采信（多半是思考过程中的草稿），请调大 max_tokens 重试"
+                )
+            elif block:
+                hints.append("reasoning 里有 JSON，但未能通过结构校验")
+            else:
+                hints.append(
+                    "reasoning 字段有 %d 字符但未找到含 positive 的 JSON" % len(reasoning)
+                )
+        if finish:
+            hints.append("finish_reason=%s" % finish)
+        if finish == "length":
+            hints.append("输出被 max_tokens 截断（思考过程可能吃光了额度）")
+        if reasoning or finish == "length":
+            hints.append(
+                "疑似 thinking 模型未关闭思考（Qwen3 / Qwen3.5 / DeepSeek-R1 等）"
+            )
+            if thinking_disabled:
+                hints.append(
+                    "本次已向该端点发送 reasoning_effort=none（关闭思考），仍然失败说明"
+                    "服务端不支持该字段，请换用非 thinking 模型、或在推理服务端"
+                    "显式关闭 enable_thinking / --reasoning off"
+                )
+            else:
+                hints.append(
+                    "本次未发送 reasoning_effort（云端或 thinking_mode=auto），"
+                    "请换用非 thinking 模型，或把 settings.json 的 thinking_mode 设回 off"
+                )
+        else:
+            hints.append("响应里既没有 content 也没有 reasoning 字段，请检查端点是否兼容 OpenAI chat/completions")
+    except Exception:  # noqa: BLE001 - 诊断信息本身不得成为新的失败点
+        hints = []
+    detail = "模型返回的 content 为空"
+    if hints:
+        detail = detail + "：" + "；".join(hints)
+    return detail[:500]
+
+
 def extract_content(payload):
     """从 HTTP 响应体里取出模型输出的文本。
 
@@ -284,6 +416,20 @@ def extract_content(payload):
                 args = _first_tool_arguments(tool_calls)
                 if args:
                     return args
+            # thinking 模型兜底（v5）：content 为空时从 reasoning 字段里提取 JSON。
+            # 该分支只在 content/parsed/tool_calls 都为空的路径上生效，
+            # **content 非空时行为完全不变**。
+            if isinstance(message, dict):
+                reasoning = _reasoning_to_text(message)
+                if reasoning:
+                    # finish_reason=length 表示输出被截断：此时 reasoning 里的 JSON
+                    # 很可能是思考过程中的**草稿**（实测 Qwen3.5 thinking 下模型会先
+                    # 复述用户给的示例 JSON 再继续思考），采信它等于静默产出错误结果。
+                    # 宁可返回空、让上层报可诊断的错误，让用户去关 thinking / 调大额度。
+                    if str(first.get("finish_reason") or "") != "length":
+                        block = _extract_json_block(reasoning)
+                        if block:
+                            return block
 
     # Anthropic 原生：{"content":[{"type":"text","text":"..."}]}
     text = _content_to_text(payload.get("content"))
@@ -320,10 +466,142 @@ def _first_tool_arguments(message):
 # --------------------------------------------------------------------------- 请求体
 
 
+#: 关闭思考时发送的 ``reasoning_effort`` 值（OpenAI 标准字段，o1/o3 系列在用）。
+REASONING_EFFORT_NONE = "none"
+
+#: ``thinking_mode`` 的合法取值：``off`` = 本地端点一律请求关闭思考；``auto`` = 不发。
+THINKING_MODES = ("off", "auto")
+
+#: ``thinking_mode`` 默认值：**off**（不关思考时 thinking 模型在 1024 max_tokens 下
+#: 会把额度全烧在思考上、``content`` 恒空，等于 100% 失败）。
+DEFAULT_THINKING_MODE = "off"
+
+_SETTINGS_FILE = PLUGIN_DIR / "data" / "settings.json"
+
+#: settings.json 的 thinking_mode 缓存（按 mtime 失效，避免每次请求都读盘）
+_THINKING_CACHE = {"mtime": None, "value": None}
+
+#: 私有网段的判定前缀（RFC1918 + 回环 + 链路本地）
+_PRIVATE_PREFIXES = (
+    "127.",
+    "10.",
+    "192.168.",
+    "169.254.",
+)
+#: 172.16.0.0/12 需要单独算（172.16 - 172.31）
+_PRIVATE_172 = range(16, 32)
+
+
+def _is_local_endpoint(base_url) -> bool:
+    """判断 ``base_url`` 是否指向本机 / 私有网段。
+
+    用于决定是否发送 ``reasoning_effort``：本地推理服务（llama.cpp / LM Studio /
+    Ollama）都支持这个字段且关掉思考收益巨大；公网云端则**不发**，
+    避免重演 ``response_format`` 被网关 400 的事故。
+
+    判定口径：host 是 ``localhost`` / 回环 / RFC1918 私有网段 / 链路本地。
+    解析失败或无 ``base_url`` 时返回 ``False``（**保守当作云端**，宁可不发）。
+    """
+    text = _as_str(base_url).strip().lower()
+    if not text:
+        return False
+    host = ""
+    try:
+        if "://" not in text:
+            text = "http://" + text
+        # urllib.parse 在这里会引入 import；用轻量手动解析避免额外依赖面
+        without_scheme = text.split("://", 1)[1]
+        authority = without_scheme.split("/", 1)[0]
+        if "@" in authority:
+            authority = authority.rsplit("@", 1)[1]
+        if authority.startswith("["):
+            # IPv6 字面量：[::1]:8080
+            host = authority[1:].split("]", 1)[0]
+        else:
+            host = authority.split(":", 1)[0]
+    except Exception:  # noqa: BLE001 - 解析失败一律当云端
+        return False
+
+    host = host.strip().lower()
+    if not host:
+        return False
+    if host in ("localhost", "::1", "0.0.0.0", "[::1]"):
+        return True
+    if host.endswith(".localhost"):
+        return True
+    for prefix in _PRIVATE_PREFIXES:
+        if host.startswith(prefix):
+            return True
+    # 172.16.x.x - 172.31.x.x
+    if host.startswith("172."):
+        parts = host.split(".")
+        if len(parts) >= 2:
+            try:
+                second = int(parts[1])
+            except (TypeError, ValueError):
+                second = -1
+            if second in _PRIVATE_172:
+                return True
+    # IPv6 回环 / 私网前缀
+    if host.startswith("fe80:") or host.startswith("fc") or host.startswith("fd"):
+        return True
+    return False
+
+
+def _thinking_mode() -> str:
+    """读取 ``settings.json`` 的 ``thinking_mode``；**任何异常都回落 ``off``**。
+
+    为什么直接读 settings.json 而不 import ``store``：本模块的设计约束是
+    「不导入 store / runtime / providers，可独立加载」（见模块 docstring），
+    这里只需要一个字符串开关，读文件即可，不引入模块级耦合。
+
+    读取顺序：``settings.thinking_mode`` -> 默认 ``off``。
+    按文件 mtime 缓存，settings 改动后自动失效。
+    """
+    try:
+        stat = _SETTINGS_FILE.stat()
+        mtime = stat.st_mtime
+    except OSError:
+        return DEFAULT_THINKING_MODE
+
+    if _THINKING_CACHE["mtime"] == mtime and _THINKING_CACHE["value"] is not None:
+        return _THINKING_CACHE["value"]
+
+    mode = DEFAULT_THINKING_MODE
+    try:
+        with open(_SETTINGS_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, dict):
+            raw = data.get("thinking_mode")
+            if isinstance(raw, str) and raw.strip().lower() in THINKING_MODES:
+                mode = raw.strip().lower()
+    except (OSError, ValueError, TypeError):
+        mode = DEFAULT_THINKING_MODE
+
+    _THINKING_CACHE["mtime"] = mtime
+    _THINKING_CACHE["value"] = mode
+    return mode
+
+
 def build_payload(cfg, messages):
     """按契约 §7 组装请求体。
 
     云端**不发送** ``top_k``；本地（``mode == "local"``）才发送。
+
+    ``reasoning_effort``（v6）：命中下面两个条件时才发 ``"none"``
+
+    1. ``cfg["base_url"]`` 指向**本机 / 私有网段**（:func:`_is_local_endpoint`）；
+    2. ``thinking_mode`` 不是 ``auto``（默认 ``off``，可由 ``settings.json`` 覆盖）。
+
+    为什么要关思考：thinking 模型（Qwen3 / Qwen3.5 / DeepSeek-R1 等）默认会把
+    输出全部写进 ``reasoning_content``，``message.content`` 恒为空；
+    实测 1024 max_tokens 下思考就吃光额度（``finish_reason=length``、content=0 字符），
+    加大到 4096 反而烧 91 秒、10329 字符思考后**仍然失败**。
+    发 ``reasoning_effort: "none"`` 后实测 25 秒失败 -> 3 秒成功。
+
+    云端**不发**：``reasoning_effort`` 虽是 OpenAI 标准字段（o1/o3 在用），
+    但部分兼容网关对未知字段严格校验会 400（``response_format`` 的前车之鉴），
+    而云端本来就该由用户自己选非 thinking 模型。
     """
     cfg = cfg if isinstance(cfg, dict) else {}
     sampling = cfg.get("sampling") if isinstance(cfg.get("sampling"), dict) else {}
@@ -358,6 +636,10 @@ def build_payload(cfg, messages):
         max_tokens = 1024
     if max_tokens > 0:
         payload["max_tokens"] = max_tokens
+
+    # v6：本地推理端点默认请求关闭思考（见 build_payload 的 docstring）
+    if _is_local_endpoint(cfg.get("base_url")) and _thinking_mode() != "auto":
+        payload["reasoning_effort"] = REASONING_EFFORT_NONE
 
     seed = sampling.get("seed", -1)
     try:
@@ -490,7 +772,15 @@ def chat_json(cfg, messages, timeout=DEFAULT_TIMEOUT):
 
     content = extract_content(envelope)
     if not content.strip():
-        raise LLMError("llm_bad_json", raw)
+        # v5：给出可诊断的详情，而不是干巴巴的 llm_bad_json。
+        # 最常见原因：thinking 模型未关闭思考（全跑进 reasoning_content，content 恒空）。
+        raise LLMError(
+            "llm_bad_json",
+            _empty_content_detail(
+                envelope,
+                thinking_disabled="reasoning_effort" in payload,
+            ),
+        )
 
     parsed = parse_json(content)
     if not isinstance(parsed, dict):
@@ -728,20 +1018,28 @@ def _static_selected(template):
     return "".join(out)
 
 
-def _render_skill_prompt(skill, catalog, selected):
+def _render_skill_prompt(skill, catalog, selected, static_selected=True):
     """渲染 ``skill.system_prompt``（占位符生效）并追加 few-shot 示例。
 
     v4 P1：``{{selected}}`` 先被 :func:`_static_selected` 静态化，再交给通用渲染
     处理 ``{{characters}}`` / ``{{styles}}`` —— 这样 system 不再随「换角色」变化。
+
+    v5：可用 ``settings.prompt_opt.static_selected=false`` 关掉静态化，
+    恢复把 ``{{selected}}`` 渲染成动态内容的旧行为（换角色会让 system 变化、
+    缓存前缀失效），仅供对照排查。
     """
     if not isinstance(skill, dict):
         return ""
     template = skill.get("system_prompt")
     if not isinstance(template, str) or not template.strip():
         return ""
-    # 给渲染器传空 selected：即使 _static_selected 有遗漏也不会把动态内容漏回
-    # system（_render_system_prompt 的兜底是「（未选择角色/风格）」）。
-    rendered = _render_system_prompt(_static_selected(template), catalog, {})
+    if static_selected:
+        # 给渲染器传空 selected：即使 _static_selected 有遗漏也不会把动态内容漏回
+        # system（_render_system_prompt 的兜底是「（未选择角色/风格）」）。
+        rendered = _render_system_prompt(_static_selected(template), catalog, {})
+    else:
+        # 老行为（v4 之前）：{{selected}} 按当前选择动态渲染
+        rendered = _render_system_prompt(template, catalog, selected)
     examples = _render_examples(skill.get("examples"))
     if examples:
         rendered = rendered.rstrip() + "\n\n示例：\n" + examples
@@ -781,6 +1079,8 @@ def build_messages(
     selected,
     skill=None,
     forbidden_tokens=(),
+    static_selected=None,
+    dedupe_skill=None,
 ):
     """组装 ``messages``（契约 §7 / §14.2）。
 
@@ -813,14 +1113,21 @@ def build_messages(
     ``dynamic_user_suffix`` 双参数版本，由调用方显式选择，而不是改变本函数的默认输出。
     """
     user_block = _render_system_prompt(system_prompt, catalog, selected)
-    skill_block = _render_skill_prompt(skill, catalog, selected)
+    skill_block = _render_skill_prompt(
+        skill, catalog, selected,
+        static_selected=True if static_selected is None else bool(static_selected),
+    )
 
     if skill_block:
         # v4 P0 去重保险：用户 system prompt 若与 skill 正文重复（典型场景是前端
         # 把「恢复默认」的值回填进了 settings / ui holder，于是传入的 system_prompt
         # 恰好等于 skill.system_prompt），只保留 skill_block，避免同一份规则书
         # 在 system 里出现两次。
-        if user_block and _is_duplicate_system_block(user_block, skill_block):
+        #
+        # v5：该保险可由 ``settings.prompt_opt.dedupe_skill=false`` 关闭
+        # （仅供 A/B 对照排查；关闭后 system 会重新出现两份规则书）。
+        dedupe_enabled = True if dedupe_skill is None else bool(dedupe_skill)
+        if dedupe_enabled and user_block and _is_duplicate_system_block(user_block, skill_block):
             user_block = ""
         # 契约 §14.2：用户可改风格（用户文本在前），skill 约束仍生效（条款在后）
         system_content = "\n\n".join(

@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 GQLI-VC
 // nl2prompt 前端 i18n（阶段 3）。
 //
 // 契约：
@@ -127,6 +125,16 @@ const ZH = {
     "composer.general.reloaded": "已重新读取通用设置",
     "composer.general.reload_failed": "读取失败：{error}",
     "composer.general.unavailable": "通用设置接口不可用（{error}）：保存会失败，显示值为默认",
+    "composer.prompt_opt.title": "提示词优化",
+    "composer.prompt_opt.hint": "这些开关只影响 LLM 的 token 消耗与缓存命中，不影响出图质量；默认全部开启。",
+    "composer.prompt_opt.unavailable": "后端未返回开关设置（或读取失败），当前按默认值显示：全部开启",
+    "composer.prompt_opt.dedupe_skill": "消除重复提示词",
+    "composer.prompt_opt.dedupe_skill_hint": "关闭会恢复「skill 注入两遍」，多消耗约 45% 输入 token，仅用于对照排查。",
+    "composer.prompt_opt.dedupe_skill_warn": "将显著增加 token 消耗",
+    "composer.prompt_opt.static_selected": "固定系统提示前缀",
+    "composer.prompt_opt.static_selected_hint": "关闭后换角色/服装时缓存前缀失效，每次都要重新计算。",
+    "composer.prompt_opt.retry_multiturn": "重试使用多轮对话",
+    "composer.prompt_opt.retry_multiturn_hint": "关闭后退回旧的重试方式（重建整个上下文）。",
     "composer.general.locale_saved": "语言已切换为{locale}，立即生效",
 
     // ---------- composer 提示词替换 Tab
@@ -494,6 +502,16 @@ const EN = {
     "composer.general.reloaded": "General settings reloaded",
     "composer.general.reload_failed": "Reload failed: {error}",
     "composer.general.unavailable": "General settings API unavailable ({error}): saving will fail, showing defaults",
+    "composer.prompt_opt.title": "Prompt optimization",
+    "composer.prompt_opt.hint": "These switches only affect LLM token usage and cache hits, never image quality. All on by default.",
+    "composer.prompt_opt.unavailable": "Backend did not return the switches (or reading failed); showing defaults: all on",
+    "composer.prompt_opt.dedupe_skill": "Dedupe system prompt",
+    "composer.prompt_opt.dedupe_skill_hint": "Turning this off injects the skill twice and costs about 45% more input tokens. For troubleshooting only.",
+    "composer.prompt_opt.dedupe_skill_warn": "Will significantly increase token usage",
+    "composer.prompt_opt.static_selected": "Static system prefix",
+    "composer.prompt_opt.static_selected_hint": "Turning this off invalidates the cached prefix whenever the character or outfit changes.",
+    "composer.prompt_opt.retry_multiturn": "Multi-turn retry",
+    "composer.prompt_opt.retry_multiturn_hint": "Turning this off falls back to rebuilding the whole context on retry.",
     "composer.general.locale_saved": "Language switched to {locale}; applied immediately",
 
     "composer.replace.hint": "When the natural language input contains the left text, the right prompt is added to the selected positive or negative target. Matching is case-insensitive.",

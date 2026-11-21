@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 GQLI-VC
 // 自然语言提示词（NL2PromptComposer）—— 主节点 UI（v2）。
 //
 // 契约：docs/接口契约.md §1（节点 IO）、§3 / §14.4（holder schema）、§7（system prompt）、
@@ -1012,7 +1010,29 @@ const UI_SETTINGS_CACHE = {
     error: "",
     ui_locale: "auto",
     default_positive_base: "",
+    // v5：提示词优化开关（缺键 = 显示开启）
+    prompt_opt: { dedupe_skill: true, static_selected: true, retry_multiturn: true },
+    prompt_opt_available: false,
 };
+
+/** 「提示词优化」开关的三个键（与后端 store.DEFAULT_PROMPT_OPT 一致）。 */
+const PROMPT_OPT_KEYS = ["dedupe_skill", "static_selected", "retry_multiturn"];
+
+/**
+ * 归一化 prompt_opt：只有显式的假值才算关闭，缺键 / 类型异常一律视为开启。
+ * 这条规则保证「用户从没设置过」与「settings.json 缺这个键」都显示为开启。
+ */
+function normalizePromptOpt(raw) {
+    const source = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+    const out = {};
+    for (const key of PROMPT_OPT_KEYS) {
+        const value = source[key];
+        out[key] = value === false || value === 0 || (typeof value === "string" && value.trim().toLowerCase() === "false")
+            ? false
+            : true;
+    }
+    return out;
+}
 
 function normalizeLocale(value) {
     const text = String(value === null || value === undefined ? "" : value).trim().toLowerCase();
@@ -1048,6 +1068,9 @@ async function ensureUiSettings(force = false) {
             UI_SETTINGS_CACHE.ui_locale = normalizeLocale(source.ui_locale);
             UI_SETTINGS_CACHE.default_positive_base =
                 typeof source.default_positive_base === "string" ? source.default_positive_base : "";
+            // v5：后端支持后会回传 prompt_opt；没有这个键时按默认全开显示
+            UI_SETTINGS_CACHE.prompt_opt_available = Object.prototype.hasOwnProperty.call(source, "prompt_opt");
+            UI_SETTINGS_CACHE.prompt_opt = normalizePromptOpt(source.prompt_opt);
         }
         UI_SETTINGS_CACHE.loaded = true;
         UI_SETTINGS_CACHE.loading = null;
@@ -1099,6 +1122,93 @@ function buildGeneralTab(ctx, draft) {
     ));
     wrap.appendChild(positiveField);
 
+    // ---- 提示词优化（v5：省 token 的三个开关）
+    wrap.appendChild(createElement("div", "anima-nl-divider"));
+    wrap.appendChild(createElement("div", "anima-nl-field-label", t("composer.prompt_opt.title")));
+    wrap.appendChild(createElement("div", "anima-nl-hint", t("composer.prompt_opt.hint")));
+
+    const promptOptInputs = {};
+    const promptOptWarns = {};
+
+    /** 派发 change：真实 DOM 用 dispatchEvent，自测 stub 用 dispatch。 */
+    function emitChange(element) {
+        try {
+            if (typeof element.dispatchEvent === "function") {
+                element.dispatchEvent(new Event("change", { bubbles: true }));
+            } else if (typeof element.dispatch === "function") {
+                element.dispatch("change", {});
+            }
+        } catch (error) {
+            console.error("[nl2prompt] 派发 change 失败", error);
+        }
+    }
+
+    for (const key of PROMPT_OPT_KEYS) {
+        const field = createElement("div", "anima-nl-field");
+        const row = createElement("div", "anima-nl-switch-row");
+        const checkbox = createElement("input", null);
+        checkbox.type = "checkbox";
+        checkbox.id = `anima-nl-prompt-opt-${key}`;
+        checkbox.checked = UI_SETTINGS_CACHE.prompt_opt[key] !== false;
+        checkbox.dataset.optKey = key;
+        checkbox.addEventListener("pointerdown", stopPointerEvent);
+        const label = createElement("label", null, t(`composer.prompt_opt.${key}`));
+        label.htmlFor = checkbox.id;
+        // 点标题也能切换（原生 label 行为在画布 DOM widget 里不稳定，显式接线）
+        label.addEventListener("click", (event) => {
+            event.preventDefault();
+            checkbox.checked = !checkbox.checked;
+            emitChange(checkbox);
+        });
+        row.append(checkbox, label);
+        field.appendChild(row);
+        field.appendChild(createElement("div", "anima-nl-hint", t(`composer.prompt_opt.${key}_hint`)));
+
+        // dedupe_skill 关闭时的橙色提醒（正常人不会关）
+        if (key === "dedupe_skill") {
+            const warn = createElement("div", "anima-nl-switch-warn", t("composer.prompt_opt.dedupe_skill_warn"));
+            warn.style.display = checkbox.checked ? "none" : "";
+            field.appendChild(warn);
+            promptOptWarns[key] = warn;
+        }
+
+        promptOptInputs[key] = checkbox;
+        wrap.appendChild(field);
+    }
+
+    const promptOptUnavailable = createElement("div", "anima-nl-hint", t("composer.prompt_opt.unavailable"));
+    promptOptUnavailable.dataset.role = "prompt-opt-unavailable";
+    promptOptUnavailable.style.display = UI_SETTINGS_CACHE.prompt_opt_available ? "none" : "";
+    wrap.appendChild(promptOptUnavailable);
+
+    /** 读取三个开关的当前值。 */
+    function readPromptOpt() {
+        const out = {};
+        for (const key of PROMPT_OPT_KEYS) {
+            const checkbox = promptOptInputs[key];
+            out[key] = checkbox ? checkbox.checked !== false : true;
+        }
+        return out;
+    }
+
+    /** 用后端值回填开关（缺键 → 开启）。 */
+    function applyPromptOpt(raw) {
+        const opt = normalizePromptOpt(raw);
+        for (const key of PROMPT_OPT_KEYS) {
+            const checkbox = promptOptInputs[key];
+            if (checkbox) checkbox.checked = opt[key] !== false;
+            const warn = promptOptWarns[key];
+            if (warn) warn.style.display = opt[key] === false ? "" : "none";
+        }
+    }
+
+    for (const key of PROMPT_OPT_KEYS) {
+        promptOptInputs[key].addEventListener("change", () => {
+            const warn = promptOptWarns[key];
+            if (warn) warn.style.display = promptOptInputs[key].checked ? "none" : "";
+        });
+    }
+
     // ---- 保存
     const actions = createElement("div", "anima-nl-actions");
     const saveButton = createElement("button", "anima-nl-action is-primary", t("composer.general.save"));
@@ -1114,6 +1224,8 @@ function buildGeneralTab(ctx, draft) {
         const payload = {
             ui_locale: normalizeLocale(localeSelect.value),
             default_positive_base: positiveInput.value,
+            // v5：跟着同一条 settings_ui 保存链路走，不另开路由
+            prompt_opt: readPromptOpt(),
         };
         const previousLocale = normalizeLocale(UI_SETTINGS_CACHE.ui_locale);
         saveButton.disabled = true;
@@ -1129,6 +1241,7 @@ function buildGeneralTab(ctx, draft) {
         UI_SETTINGS_CACHE.error = "";
         UI_SETTINGS_CACHE.ui_locale = payload.ui_locale;
         UI_SETTINGS_CACHE.default_positive_base = payload.default_positive_base;
+        UI_SETTINGS_CACHE.prompt_opt = payload.prompt_opt;
         if (kind === "locale") {
             // 先切语言再写状态：这条消息本身也要用新语言渲染
             if (previousLocale !== payload.ui_locale) applyLocale(payload.ui_locale);
@@ -1153,6 +1266,8 @@ function buildGeneralTab(ctx, draft) {
         const cache = await ensureUiSettings(true);
         localeSelect.value = cache.ui_locale;
         positiveInput.value = cache.default_positive_base;
+        applyPromptOpt(cache.prompt_opt);
+        promptOptUnavailable.style.display = cache.prompt_opt_available ? "none" : "";
         if (cache.ok && normalizeLocale(cache.ui_locale) !== currentMode()) applyLocale(cache.ui_locale);
         ctx.setStatus(
             cache.ok
@@ -1174,6 +1289,8 @@ function buildGeneralTab(ctx, draft) {
     void ensureUiSettings(true).then((cache) => {
         localeSelect.value = cache.ui_locale;
         positiveInput.value = cache.default_positive_base;
+        applyPromptOpt(cache.prompt_opt);
+        promptOptUnavailable.style.display = cache.prompt_opt_available ? "none" : "";
         if (!cache.ok) {
             ctx.setStatus(t("composer.general.unavailable", { error: cache.error || "network" }), "error");
         }

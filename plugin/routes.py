@@ -1002,6 +1002,10 @@ async def _handle_rewrite(request):
             "fallback": str(debug.get("fallback") or ""),
             "retried": retried,
             "negative_missing": negative_missing,
+            # 标签库归一结果：用户必须能看到哪些标签被改写，否则改动是隐形的
+            "tagdb": debug.get("tagdb") if isinstance(debug.get("tagdb"), dict) else None,
+            # 本次生效的 token 优化开关，便于排查"为什么没有省 token"
+            "prompt_opt": debug.get("prompt_opt") if isinstance(debug.get("prompt_opt"), dict) else None,
         },
     }
 
@@ -1372,11 +1376,18 @@ async def _handle_settings_ui_get(request):
     if not isinstance(settings, dict):
         settings = {}
 
+    # prompt_opt：三项 token 优化开关，由 store.save_settings 归一成 bool 并只取
+    # 已知的 dedupe_skill / static_selected / retry_multiturn 三个键，这里只做透传。
+    prompt_opt = settings.get("prompt_opt")
+    if not isinstance(prompt_opt, dict):
+        prompt_opt = {}
+
     return {
         "ok": True,
         "ui_locale": str(settings.get("ui_locale") or "auto"),
         "default_positive_base": str(settings.get("default_positive_base") or ""),
         "default_negative_base": str(settings.get("default_negative_base") or ""),
+        "prompt_opt": prompt_opt,
     }
 
 
@@ -1404,12 +1415,22 @@ async def _handle_settings_ui_post(request):
                 "default_positive_base must be a string",
             )
         patch["default_positive_base"] = value
+    if "prompt_opt" in body:
+        value = body.get("prompt_opt")
+        if not isinstance(value, dict):
+            return _error(
+                "bad_request",
+                "prompt_opt 必须是对象",
+                "prompt_opt must be an object",
+            )
+        # 只透传，逐键的类型归一与已知键过滤由 store.save_settings 负责
+        patch["prompt_opt"] = value
 
     if not patch:
         return _error(
             "bad_request",
-            "没有可更新的字段（支持 ui_locale / default_positive_base）",
-            "No updatable fields (expected ui_locale / default_positive_base)",
+            "没有可更新的字段（支持 ui_locale / default_positive_base / prompt_opt）",
+            "No updatable fields (expected ui_locale / default_positive_base / prompt_opt)",
         )
 
     module = _store_module()

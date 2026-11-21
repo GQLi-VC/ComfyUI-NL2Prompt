@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: AGPL-3.0-only
-# Copyright (C) 2026 GQLI-VC
+# -*- coding: utf-8 -*-
 """自然语言提示词插件 —— 数据层（store）。
 
 对外接口见 ``docs/接口契约.md`` §10：
@@ -80,9 +80,46 @@ DEFAULT_UI_LOCALE = "auto"
 #: v3：本地 LLM 运行偏好（由 llm-runtime 消费，本模块只负责存取）。
 DEFAULT_LLM_LOCAL = {"dtype": "fp16", "unload_after_use": False}
 
-DEFAULT_LLAMA_SERVER_PATH = ""  # 开源版留空：在「本地设置」里填你自己的 llama-server 路径
+#: v5：提示词优化开关（用户可在设置里关掉，**默认全开**）。
+#:
+#: * ``dedupe_skill``：是否消除 system 里 skill 被注入两遍。
+#:   **关闭会恢复双份注入，实测多烧约 45% 的 system token**；
+#:   保留开关只是为了让用户能对照排查，正常使用请保持开启。
+#: * ``static_selected``：是否把 skill 正文里的 ``{{selected}}`` 静态化成
+#:   指向 user【已选约束】的指针。关闭后换角色会让 system 变化、缓存前缀失效。
+#: * ``retry_multiturn``：重试是否用多轮追加（``[system,user,assistant,user]``）。
+#:   关闭则退回旧路径（重建 messages + 把 issues 拼到 user 末尾）。
+DEFAULT_PROMPT_OPT = {
+    "dedupe_skill": True,
+    "static_selected": True,
+    "retry_multiturn": True,
+}
 
-DEFAULT_MODEL_ROOTS = []  # 开源版留空：在「本地设置」里添加你自己的模型根目录
+#: ``prompt_opt`` 各键的中文说明（供设置面板 / 日志使用，不含非 GBK 字符）
+PROMPT_OPT_LABELS = {
+    "dedupe_skill": "消除 skill 重复注入（关闭会显著增加 token 消耗）",
+    "static_selected": "静态化 {{selected}}（关闭后换角色缓存失效）",
+    "retry_multiturn": "重试多轮追加（关闭则重建 messages）",
+}
+
+#: v6：thinking 模型「关思考」策略。
+#:
+#: * ``off``（默认）：对**本地 / 私有网段**端点发送 ``reasoning_effort: "none"``。
+#:   thinking 模型（Qwen3 / Qwen3.5 / DeepSeek-R1）默认把输出全写进
+#:   ``reasoning_content``，``content`` 恒空；实测 1024 max_tokens 下 100% 失败，
+#:   加到 4096 反而烧 91 秒、10329 字符思考后仍失败。
+#:   发 ``reasoning_effort: none`` 后实测 25 秒失败 -> 3 秒成功。
+#: * ``auto``：不发该字段（想自己接管思考行为时用）。
+#:
+#: **只对本地端点生效**，云端不发，避免重演 ``response_format`` 被网关 400 的事故。
+DEFAULT_THINKING_MODE = "off"
+
+#: ``thinking_mode`` 合法取值
+THINKING_MODES = ("off", "auto")
+
+DEFAULT_LLAMA_SERVER_PATH = r"H:\AI\Local\llama.cpp\llama-server.exe"
+
+DEFAULT_MODEL_ROOTS = [r"H:\AI\Local\Models"]
 
 #: 内置**精简版** system prompt：仅在 ``skill_store`` 不可用时兜底。
 #: 契约 §14.5「system prompt 内容迁入 skill 文件」——完整文案在
@@ -349,6 +386,47 @@ def _default_settings() -> dict:
         "default_system_prompt": "",
         "ui_locale": DEFAULT_UI_LOCALE,
         "llm_local": dict(DEFAULT_LLM_LOCAL),
+        "prompt_opt": dict(DEFAULT_PROMPT_OPT),
+        "thinking_mode": DEFAULT_THINKING_MODE,
+    }
+
+
+#: 视为「开」的字符串写法（大小写不敏感）
+_TRUTHY_TEXT = ("1", "true", "yes", "on", "开", "开启")
+
+
+def _as_option_bool(value, default):
+    """把配置里的开关值归一成 bool；无法判断时回落 ``default``（绝不抛异常）。
+
+    注意 ``bool("false")`` 在 Python 里是 ``True``，所以字符串必须单独按
+    ``_TRUTHY_TEXT`` 判定，不能直接 ``bool()``。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if not text:
+            return default
+        if text in _TRUTHY_TEXT:
+            return True
+        if text in ("0", "false", "no", "off", "关", "关闭"):
+            return False
+        return default
+    return default
+
+
+def _build_prompt_opt(raw) -> dict:
+    """解析 ``prompt_opt``：缺键 / 类型错 / 非 dict 一律回落默认（**全开**）。
+
+    这是「读配置失败不能退化成双份注入」这条硬要求的落点：
+    无论传进来什么，返回值都一定是完整的三个 bool。
+    """
+    source = raw if isinstance(raw, dict) else {}
+    return {
+        key: _as_option_bool(source.get(key, default), default)
+        for key, default in DEFAULT_PROMPT_OPT.items()
     }
 
 
@@ -547,6 +625,15 @@ def _build_settings() -> dict:
             merged["unload_after_use"] = unload
         base["llm_local"] = merged
 
+    # v5：提示词优化开关（缺键 / 类型错回落默认全开）
+    if "prompt_opt" in raw:
+        base["prompt_opt"] = _build_prompt_opt(raw.get("prompt_opt"))
+
+    # v6：thinking 关思考策略（缺键 / 非法值回落 off）
+    thinking = _text(raw.get("thinking_mode")).strip().lower()
+    if thinking in THINKING_MODES:
+        base["thinking_mode"] = thinking
+
     return base
 
 
@@ -593,6 +680,25 @@ def load_settings() -> dict:
         return _default_settings()
 
 
+def prompt_options() -> dict:
+    """读取「提示词优化开关」，**任何异常都回落默认（全开）**。
+
+    这是给 ``nodes`` / ``llm_client`` 用的稳定入口。硬要求：
+    * 本模块不可用、settings.json 损坏、``prompt_opt`` 缺失、
+      类型不对、值非法 —— 全部返回 :data:`DEFAULT_PROMPT_OPT` 的完整副本；
+    * **绝不因为读配置失败而退化成「双份注入」**（那会白烧 45% token）。
+
+    :returns: ``{"dedupe_skill": bool, "static_selected": bool,
+        "retry_multiturn": bool}``
+    """
+    try:
+        settings = load_settings()
+        return _build_prompt_opt(settings.get("prompt_opt"))
+    except Exception as exc:  # noqa: BLE001
+        _warn("prompt_options 读取失败，回落默认全开: %r" % (exc,))
+        return dict(DEFAULT_PROMPT_OPT)
+
+
 #: 允许经 ``save_settings`` 写入的键（白名单，防止把任意垃圾写进配置文件）
 WRITABLE_SETTINGS = (
     "llama_server_path",
@@ -602,6 +708,8 @@ WRITABLE_SETTINGS = (
     "default_system_prompt",
     "ui_locale",
     "llm_local",
+    "prompt_opt",
+    "thinking_mode",
 )
 
 _UI_LOCALES = ("auto", "zh", "en")
@@ -649,6 +757,22 @@ def save_settings(patch: dict) -> dict:
 
     if "llm_local" in incoming and not isinstance(incoming["llm_local"], dict):
         return {"ok": False, "error": "llm_local 必须是对象", "settings": current}
+
+    if "prompt_opt" in incoming:
+        if not isinstance(incoming["prompt_opt"], dict):
+            return {"ok": False, "error": "prompt_opt 必须是对象", "settings": current}
+        # 只接受三个已知键，值归一成 bool（非法值回落默认，不报错）
+        incoming["prompt_opt"] = _build_prompt_opt(incoming["prompt_opt"])
+
+    if "thinking_mode" in incoming:
+        mode_value = _text(incoming.get("thinking_mode")).strip().lower()
+        if mode_value not in THINKING_MODES:
+            return {
+                "ok": False,
+                "error": "thinking_mode 只能是 off / auto",
+                "settings": current,
+            }
+        incoming["thinking_mode"] = mode_value
 
     if "model_roots" in incoming:
         roots = incoming["model_roots"]

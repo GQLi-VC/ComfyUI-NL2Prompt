@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 GQLI-VC
 // ComfyUI 自然语言提示词 —— 前端公共库。
 //
 // 契约：docs/接口契约.md §9（前端契约）
@@ -263,6 +261,19 @@ const STYLES = `
 }
 .anima-nl-action:disabled { opacity: 0.55; cursor: default; }
 .anima-nl-divider { height: 1px; background: rgba(255, 255, 255, 0.08); margin: 2px 0; }
+
+/* v5：设置面板里的开关行（提示词优化） */
+.anima-nl-switch-row { display: flex; align-items: center; gap: 8px; }
+.anima-nl-switch-row input[type="checkbox"] {
+    width: 15px;
+    height: 15px;
+    margin: 0;
+    flex: 0 0 auto;
+    cursor: pointer;
+    accent-color: var(--anima-nl-accent);
+}
+.anima-nl-switch-row label { cursor: pointer; font-size: 12px; font-weight: 600; }
+.anima-nl-switch-warn { color: #f59e0b; font-size: 11px; line-height: 1.4; }
 .anima-nl-hint.is-error { color: #f87171; }
 .anima-nl-hint.is-ok { color: #4ade80; }
 .anima-nl-fetch { display: flex; flex-direction: column; gap: 4px; width: 100%; overflow: hidden; }
