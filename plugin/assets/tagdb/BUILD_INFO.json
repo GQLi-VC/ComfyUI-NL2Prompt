@@ -1,0 +1,250 @@
+{
+  "schema_version": 1,
+  "tool_version": "1.0.0",
+  "built_at": "2026-11-21T15:59:43+08:00",
+  "builder": "build_tagdb.py",
+  "python_version": "3.13.11",
+  "sqlite_version": "3.50.4",
+  "arguments": {
+    "sample": 0,
+    "no_notes": false,
+    "drop_artist": false,
+    "with_trigram": false,
+    "refresh": false
+  },
+  "counts": {
+    "tags": 155125,
+    "aliases": 172160,
+    "aliases_attempted": 172160,
+    "aliases_distinct": 166441,
+    "aliases_multi": 4288,
+    "aliases_ambiguous": 5,
+    "with_zh": 99952,
+    "with_notes": 78945,
+    "category": {
+      "general": 34773,
+      "artist": 61411,
+      "copyright": 10891,
+      "character": 47448,
+      "meta": 602
+    },
+    "post_count_tiers": {
+      ">=100000": 638,
+      ">=10000": 3527,
+      ">=1000": 15443,
+      ">=100": 78567,
+      ">=10": 155081,
+      ">=1": 155085
+    }
+  },
+  "features": {
+    "tag_fts": true,
+    "zh_fts_trigram": false
+  },
+  "database": {
+    "path": "J:\\DeepseekHarnessDesktop_Workspace\\ComfyUI_NatureTextToPrompt\\plugin\\assets\\tagdb\\danbooru.db",
+    "bytes": 38608896,
+    "mib": 36.82,
+    "sha256": "bde4bb161c4061b6dcf89bf4a8ac83a72ec8f4b148846092165b32d344af452c",
+    "content_sha256": "53f42e414a071688b7c959578c47f26116c144686462618e28b1ba80967278a8",
+    "content_sha256_note": "按 name 排序的 (name,category,post_count,zh,notes,aliases) 内容指纹，不含 built_at；两次构建此值应相同"
+  },
+  "sources": [
+    {
+      "label": "a1111_danbooru",
+      "source_name": "local-cache",
+      "url": "file://C:/Users/ADMINI~1/AppData/Local/Temp/nl2prompt_tagdb_cache/a1111_danbooru.csv",
+      "candidates": [
+        "https://api.github.com/repos/DominikDoom/a1111-sd-webui-tagcomplete/contents/tags/danbooru.csv",
+        "https://raw.githubusercontent.com/DominikDoom/a1111-sd-webui-tagcomplete/main/tags/danbooru.csv",
+        "https://gh-proxy.com/https://raw.githubusercontent.com/DominikDoom/a1111-sd-webui-tagcomplete/main/tags/danbooru.csv",
+        "https://cdn.jsdelivr.net/gh/DominikDoom/a1111-sd-webui-tagcomplete@main/tags/danbooru.csv"
+      ],
+      "bytes": 3518020,
+      "sha256": "f936684fa0b041e9a55d35f2052588e28d95eef8672be6829241f8b1a7214732",
+      "seconds": 0.0,
+      "attempts": 0,
+      "downloaded_at": "2026-11-21T15:59:33+08:00"
+    },
+    {
+      "label": "amela_general",
+      "source_name": "local-cache",
+      "url": "file://C:/Users/ADMINI~1/AppData/Local/Temp/nl2prompt_tagdb_cache/amela_general.csv",
+      "candidates": [
+        "https://api.github.com/repos/amenorira/danbooru-tags-data-zh/contents/tags/general.csv",
+        "https://hf-mirror.com/datasets/ame-la/danbooru-tags-data-zh/resolve/main/tags/general.csv",
+        "https://raw.githubusercontent.com/amenorira/danbooru-tags-data-zh/main/tags/general.csv",
+        "https://cdn.jsdelivr.net/gh/amenorira/danbooru-tags-data-zh@main/tags/general.csv"
+      ],
+      "bytes": 2591317,
+      "sha256": "4df46d24d61ee32b96d9aa79ae390b0c35bdd99ce15d591b617dc949e92c4240",
+      "seconds": 0.0,
+      "attempts": 0,
+      "downloaded_at": "2026-11-21T15:59:33+08:00"
+    },
+    {
+      "label": "amela_artist",
+      "source_name": "local-cache",
+      "url": "file://C:/Users/ADMINI~1/AppData/Local/Temp/nl2prompt_tagdb_cache/amela_artist.csv",
+      "candidates": [
+        "https://api.github.com/repos/amenorira/danbooru-tags-data-zh/contents/tags/artist.csv",
+        "https://hf-mirror.com/datasets/ame-la/danbooru-tags-data-zh/resolve/main/tags/artist.csv",
+        "https://raw.githubusercontent.com/amenorira/danbooru-tags-data-zh/main/tags/artist.csv",
+        "https://cdn.jsdelivr.net/gh/amenorira/danbooru-tags-data-zh@main/tags/artist.csv"
+      ],
+      "bytes": 2186153,
+      "sha256": "e49673e44e2c0a57cd3defac312d1038b9886b14f780154c82f3a8c6116f99ef",
+      "seconds": 0.0,
+      "attempts": 0,
+      "downloaded_at": "2026-11-21T15:59:33+08:00"
+    },
+    {
+      "label": "amela_copyright",
+      "source_name": "local-cache",
+      "url": "file://C:/Users/ADMINI~1/AppData/Local/Temp/nl2prompt_tagdb_cache/amela_copyright.csv",
+      "candidates": [
+        "https://api.github.com/repos/amenorira/danbooru-tags-data-zh/contents/tags/copyright.csv",
+        "https://hf-mirror.com/datasets/ame-la/danbooru-tags-data-zh/resolve/main/tags/copyright.csv",
+        "https://raw.githubusercontent.com/amenorira/danbooru-tags-data-zh/main/tags/copyright.csv",
+        "https://cdn.jsdelivr.net/gh/amenorira/danbooru-tags-data-zh@main/tags/copyright.csv"
+      ],
+      "bytes": 1254255,
+      "sha256": "704a0cb3379a26fc264ad1c4222b27ec92cc0b5592a9e40f840dbdd6d70e7db1",
+      "seconds": 0.0,
+      "attempts": 0,
+      "downloaded_at": "2026-11-21T15:59:33+08:00"
+    },
+    {
+      "label": "amela_character",
+      "source_name": "local-cache",
+      "url": "file://C:/Users/ADMINI~1/AppData/Local/Temp/nl2prompt_tagdb_cache/amela_character.csv",
+      "candidates": [
+        "https://api.github.com/repos/amenorira/danbooru-tags-data-zh/contents/tags/character.csv",
+        "https://hf-mirror.com/datasets/ame-la/danbooru-tags-data-zh/resolve/main/tags/character.csv",
+        "https://raw.githubusercontent.com/amenorira/danbooru-tags-data-zh/main/tags/character.csv",
+        "https://cdn.jsdelivr.net/gh/amenorira/danbooru-tags-data-zh@main/tags/character.csv"
+      ],
+      "bytes": 4020958,
+      "sha256": "f77948b3d882641a65af37305f5a052257f841e259d7cc95c22163daa0146fe3",
+      "seconds": 0.0,
+      "attempts": 0,
+      "downloaded_at": "2026-11-21T15:59:33+08:00"
+    },
+    {
+      "label": "amela_meta",
+      "source_name": "local-cache",
+      "url": "file://C:/Users/ADMINI~1/AppData/Local/Temp/nl2prompt_tagdb_cache/amela_meta.csv",
+      "candidates": [
+        "https://api.github.com/repos/amenorira/danbooru-tags-data-zh/contents/tags/meta.csv",
+        "https://hf-mirror.com/datasets/ame-la/danbooru-tags-data-zh/resolve/main/tags/meta.csv",
+        "https://raw.githubusercontent.com/amenorira/danbooru-tags-data-zh/main/tags/meta.csv",
+        "https://cdn.jsdelivr.net/gh/amenorira/danbooru-tags-data-zh@main/tags/meta.csv"
+      ],
+      "bytes": 55085,
+      "sha256": "e6010c10277b1ed30fcf19b6d4f2bf74d9340c18a882441796e895d25123b7d2",
+      "seconds": 0.0,
+      "attempts": 0,
+      "downloaded_at": "2026-11-21T15:59:33+08:00"
+    }
+  ],
+  "checks": [
+    {
+      "check": "tag 行数",
+      "ok": true,
+      "detail": "155125 == 155125"
+    },
+    {
+      "check": "无意外废弃标记",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "check": "name 无重复",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "check": "别名数 > 0",
+      "ok": true,
+      "detail": "172160"
+    },
+    {
+      "check": "标准标签存在 1girl",
+      "ok": true,
+      "detail": "post_count=8314081"
+    },
+    {
+      "check": "标准标签存在 solo",
+      "ok": true,
+      "detail": "post_count=6984063"
+    },
+    {
+      "check": "标准标签存在 twintails",
+      "ok": true,
+      "detail": "post_count=1223991"
+    },
+    {
+      "check": "标准标签存在 white_thighhighs",
+      "ok": true,
+      "detail": "post_count=344982"
+    },
+    {
+      "check": "别名 boobs -> breasts",
+      "ok": true,
+      "detail": "breasts"
+    },
+    {
+      "check": "twintail 别名多候选存在",
+      "ok": true,
+      "detail": "候选 2 个"
+    },
+    {
+      "check": "别名消歧 twintail -> twintails（不是 aoha_(twintail)）",
+      "ok": true,
+      "detail": "twintails"
+    },
+    {
+      "check": "每个 alias 只允许一个 is_best",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "check": "消歧 boobs -> breasts",
+      "ok": true,
+      "detail": "breasts"
+    },
+    {
+      "check": "消歧 thighhigh -> thighhighs",
+      "ok": true,
+      "detail": "thighhighs"
+    },
+    {
+      "check": "中文译名覆盖",
+      "ok": true,
+      "detail": "99952"
+    },
+    {
+      "check": "中文译名可查（双马尾）",
+      "ok": true,
+      "detail": "twintails"
+    },
+    {
+      "check": "中文别名条数",
+      "ok": true,
+      "detail": "41137"
+    },
+    {
+      "check": "中文别名可查（女孩子 -> 1girl）",
+      "ok": true,
+      "detail": "1girl"
+    },
+    {
+      "check": "FTS5 前缀检索 twintail*",
+      "ok": true,
+      "detail": ""
+    }
+  ],
+  "timing": {
+    "build_seconds": 8.8
+  }
+}
