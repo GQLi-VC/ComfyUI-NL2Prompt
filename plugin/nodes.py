@@ -1561,11 +1561,45 @@ def _extract_llm_result(parsed, core):
 
 
 def _build_messages_for(config, core, natural_language, view, skill, forbidden_tokens=()):
-    """统一构造 LLM messages（首次调用与重试共用，避免两套逻辑漂移）。"""
+    """统一构造 LLM messages（首次调用与重试共用，避免两套逻辑漂移）。
+
+    v4 P0 —— 修复 system 里 skill 双份注入。
+
+    改动前是 ``system_prompt = config["system_prompt"] or _default_system_prompt()``，
+    而 ``_default_system_prompt()`` -> ``store.default_system_prompt()`` 返回的
+    **正是默认 skill 的 system_prompt 原文**（实测逐字节相同，4525 字符）。
+    于是 ``llm_client.build_messages`` 把 system_prompt 与 skill 各渲染一遍再
+    ``"\\n\\n".join``，同一份规则书在 system 里出现两次 —— 实测默认配置下
+    system 达 10857 字符，其中 4525 字符纯属重复，且**每次调用都烧**。
+
+    修复后的判据（优先级从高到低）：
+
+    1. 用户在 ui 里显式填了 ``system_prompt`` -> 用它（用户意志优先）；
+    2. 否则若 ``skill`` 自带非空 ``system_prompt`` -> 传空串，由 ``skill_block``
+       单独提供（内容不会丢，因为 ``store.default_system_prompt()`` 返回的就是它）；
+    3. 否则（``skill`` 缺失或 skill 正文为空）-> 仍用 ``_default_system_prompt()``
+       兜底，**保证契约 §7「skill=None 时与 v1 逐字节一致」不被破坏**。
+
+    安全性：``store.default_system_prompt()`` 只读 skill store、不读 settings 里
+    的用户自定义值（自定义值走 ``config["system_prompt"]``），所以第 2 条不会
+    吞掉任何用户设置。
+    """
     if _llm_client is None:
         raise LLMError(ERR_NOT_CONNECTED, "llm_client.py 不可用")
 
-    system_prompt = config["system_prompt"] or _default_system_prompt()
+    user_system_prompt = config["system_prompt"]
+    skill_has_prompt = (
+        isinstance(skill, dict)
+        and isinstance(skill.get("system_prompt"), str)
+        and bool(skill.get("system_prompt").strip())
+    )
+    if user_system_prompt:
+        system_prompt = user_system_prompt
+    elif skill_has_prompt:
+        system_prompt = ""
+    else:
+        system_prompt = _default_system_prompt()
+
     build = getattr(_llm_client, "build_messages", None)
     if not callable(build):
         raise LLMError(ERR_NOT_CONNECTED, "llm_client.build_messages 缺失")
@@ -1650,7 +1684,14 @@ def _merge_suppress_into_negative(llm_negative, forbidden_tokens, template_negat
 
 
 def _append_retry_issues(messages, issues):
-    """契约 §14.2：校验失败后带 issues 重试 1 次（把问题追加到 user 消息）。"""
+    """【已停用，保留仅为兼容可能的旧调用方】
+
+    v3 及更早的做法：把 issues 直接拼到**第一条 user 消息**末尾，然后整份
+    messages 重新发给 LLM。问题是它必须配合「从头重建 messages」使用，
+    等于把 skill 全文（约 4.5k 字符）和 few-shot（约 1.1k 字符）再发一遍。
+
+    新实现见 :func:`_build_retry_messages`（多轮追加，system/user 一字不改）。
+    """
     if not isinstance(messages, list) or not messages:
         return messages
     lines = []
@@ -1666,6 +1707,84 @@ def _append_retry_issues(messages, issues):
         (_s(last.get("content")) + "\n\n"
          + "上次输出未通过校验，请修正以下问题后重新输出 JSON：\n"
          + "\n".join(lines))
+    )
+    return appended
+
+
+#: 重试时回放给模型的 assistant 内容上限（字符）。
+#: 正常输出是几百字符的 JSON；设上限只防模型抽风输出超长文本把上下文撑爆。
+RETRY_ASSISTANT_MAX_CHARS = 4000
+
+#: 重试时追加的 user 消息开头（与旧行为保持同样的引导语，便于日志对照）
+RETRY_USER_PREFIX = "上次输出未通过校验，请修正以下问题后重新输出 JSON："
+
+
+def _retry_assistant_text(parsed):
+    """把上一轮 LLM 的解析结果还原成可回放的 assistant 文本。
+
+    为什么用 ``json.dumps(parsed)`` 而不是「服务端返回的原始字符串」：
+
+    1. 原始字符串可能裹着 ```` ```json ```` 围栏（``parse_json_loose`` 会剥掉），
+       原样回放会诱导模型下一轮继续带围栏，反而降低解析成功率；
+    2. 规范化后的 JSON 与模型上一轮的**内容**完全一致，多轮对话里足够让模型
+       看清自己写了什么，不需要逐字节还原格式；
+    3. 不需要改动 ``llm_client.chat_json`` 的返回结构（那条路径还有别的消费方）。
+
+    :returns: JSON 文本；``parsed`` 不是 dict 时返回空串（调用方会跳过 assistant 轮）
+    """
+    if not isinstance(parsed, dict):
+        return ""
+    try:
+        text = json.dumps(parsed, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return ""
+    if len(text) > RETRY_ASSISTANT_MAX_CHARS:
+        text = text[:RETRY_ASSISTANT_MAX_CHARS] + "...(truncated)"
+    return text
+
+
+def _build_retry_messages(messages, assistant_text, issues):
+    """契约 §14.2 重试：改成**多轮追加**，system / user 一字不改。
+
+    为什么要重写（v3 及以前的做法见 :func:`_append_retry_issues`）：
+
+    旧实现调 ``_build_messages_for()`` 从头重建整份 messages 再发一次。而
+    system 内容 = 用户 system_prompt + skill.system_prompt(4525 字符) +
+    few-shot(1113 字符)，**与第一次逐字节相同** —— 既白烧一遍 token，
+    也让服务端的 prompt cache / KV cache 无法复用第一轮已经算好的前缀。
+
+    新结构（只追加、不改写）::
+
+        [system, user, assistant(上一轮输出), user(修正要求)]
+
+    于是 ``[system, user]`` 这个前缀与首次请求**逐字节一致**，llama.cpp 的
+    prompt cache、OpenAI / DeepSeek 的 prefix cache 都能直接命中。
+
+    注意：本函数**不修改**传入的 ``messages``（返回的是逐条浅拷贝的新列表），
+    保证首次请求的 messages 仍可被调用方原样复用。
+
+    :param messages: 首次请求用的 messages
+    :param assistant_text: 上一轮输出（见 :func:`_retry_assistant_text`）
+    :param issues: ``check_anima`` 的 issues 列表
+    :returns: 新的 messages；无 issues 或 messages 非法时**原样返回**入参
+    """
+    if not isinstance(messages, list) or not messages:
+        return messages
+
+    lines = []
+    for issue in _dicts(issues)[:10]:
+        code = _s(issue.get("code")) or "issue"
+        detail = _s(issue.get("detail"))
+        lines.append(f"- {code}: {detail}" if detail else f"- {code}")
+    if not lines:
+        return messages
+
+    appended = [dict(message) for message in messages]
+    text = assistant_text if isinstance(assistant_text, str) else ""
+    if text.strip():
+        appended.append({"role": "assistant", "content": text})
+    appended.append(
+        {"role": "user", "content": RETRY_USER_PREFIX + "\n" + "\n".join(lines)}
     )
     return appended
 
@@ -1846,7 +1965,13 @@ def _rewrite_only(llm, natural_language, ui, data=None, core=None):
         (core["debug"].get("negative_suppress_source") or {}).get("outfit") or []
     )
 
+    # 首次请求的 messages **显式构造并保留**：重试要在它后面追加轮次，
+    # 而不是像旧实现那样从头重建（那样 system 会重复发送 skill 全文 + few-shot）。
+    first_messages = None
     try:
+        first_messages = _build_messages_for(
+            config, core, natural_language, view, skill, forbidden_tokens
+        )
         positive, negative, analysis, extra, parsed = _call_llm_once(
             natural_language,
             config,
@@ -1854,6 +1979,7 @@ def _rewrite_only(llm, natural_language, ui, data=None, core=None):
             llm,
             view,
             skill,
+            messages=first_messages,
             forbidden_tokens=forbidden_tokens,
         )
     except LLMError as exc:
@@ -1873,11 +1999,14 @@ def _rewrite_only(llm, natural_language, ui, data=None, core=None):
 
     if not check.get("ok", True):
         # 契约 §14.2：带 issues 重试 **1 次**
+        #
+        # v4 优化：改成**多轮追加**（[system, user, assistant, user]），
+        # 直接复用首次的 first_messages，system 前缀逐字节不变 ->
+        # 服务端 prompt cache 可命中，不再重复计算 4.5k+1.1k 字符的 skill 全文。
         retried = True
-        retry_messages = _append_retry_issues(
-            _build_messages_for(
-                config, core, natural_language, view, skill, forbidden_tokens
-            ),
+        retry_messages = _build_retry_messages(
+            first_messages,
+            _retry_assistant_text(parsed),
             check.get("issues") or [],
         )
         try:

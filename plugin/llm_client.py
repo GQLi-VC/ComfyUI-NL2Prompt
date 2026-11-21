@@ -376,6 +376,17 @@ def build_payload(cfg, messages):
             payload["top_k"] = top_k
         if seed >= 0:
             payload["seed"] = seed
+
+        # 关于 prompt cache：这里**刻意不发送** ``cache_prompt``。
+        #
+        # llama.cpp 的 server 从 2023 年底那一批版本起 ``cache_prompt`` 默认就是
+        # 开启的，显式发 ``true`` 与本机默认行为完全等价，收益为 0；而部分
+        # OpenAI 兼容网关（LM Studio / one-api / 各类中转）对请求体的未知字段
+        # 是严格校验的，多发一个字段会把它们打成 400，属于「零收益 + 真实风险」。
+        #
+        # 真正让缓存命中的改动在 backend 侧：重试不再重建 messages，而是
+        # [system, user, assistant, user] 多轮追加（见 nodes._build_retry_messages），
+        # 首轮与重试的 [system, user] 前缀逐字节相同，服务端 KV 前缀可直接复用。
     # 云端：top_k / seed 一律不发（契约 §7）
 
     return payload
@@ -679,18 +690,86 @@ def _render_examples(examples, limit=2):
     return "\n\n".join(blocks)
 
 
+#: skill 正文里 ``{{selected}}`` 的静态替代文本（v4 P1）。
+#:
+#: 为什么要把 ``{{selected}}`` 静态化：
+#: ``{{selected}}`` 渲染的是「当前选中的角色 / 风格」，用户每换一次角色 system
+#: 就变一次。实测默认 skill 在两处引用它（offset 150 和 offset 2008），换角色后
+#: system 的公共前缀只剩 4.9%，等于 96.8% 的前缀缓存作废。
+#:
+#: 而选中信息在 :func:`_build_user_content` 的【已选约束】块里**已经完整给出**，
+#: system 里这一份纯属重复。替换成指向 user 的静态文案后，system 变成 100% 静态，
+#: 同一 skill 下无论怎么换角色都能命中同一份缓存前缀。
+#:
+#: 作用范围：**只作用于 skill 的 system_prompt**。用户自写的 system prompt 里若
+#: 也有 ``{{selected}}`` 仍照常渲染（契约 §7 要求 ``skill=None`` 时行为不变）。
+SELECTED_POINTER_TEXT = "（详见用户消息中的【已选约束】）"
+SELECTED_INLINE_TEXT = "【已选约束】"
+
+
+def _static_selected(template):
+    """把模板里所有的 ``{{selected}}`` 按出现次序替换成静态文本。
+
+    第 1 处（通常是「【当前用户选择】」小节）换成完整指引，其余各处换成简短
+    指代，让句子仍然通顺。
+
+    :param template: skill 的 ``system_prompt`` 原文
+    :returns: 替换后的模板；无占位符时原样返回
+    """
+    if not isinstance(template, str):
+        return ""
+    if PH_SELECTED not in template:
+        return template
+    parts = template.split(PH_SELECTED)
+    out = [parts[0]]
+    for index, tail in enumerate(parts[1:]):
+        out.append(SELECTED_POINTER_TEXT if index == 0 else SELECTED_INLINE_TEXT)
+        out.append(tail)
+    return "".join(out)
+
+
 def _render_skill_prompt(skill, catalog, selected):
-    """渲染 ``skill.system_prompt``（占位符生效）并追加 few-shot 示例。"""
+    """渲染 ``skill.system_prompt``（占位符生效）并追加 few-shot 示例。
+
+    v4 P1：``{{selected}}`` 先被 :func:`_static_selected` 静态化，再交给通用渲染
+    处理 ``{{characters}}`` / ``{{styles}}`` —— 这样 system 不再随「换角色」变化。
+    """
     if not isinstance(skill, dict):
         return ""
     template = skill.get("system_prompt")
     if not isinstance(template, str) or not template.strip():
         return ""
-    rendered = _render_system_prompt(template, catalog, selected)
+    # 给渲染器传空 selected：即使 _static_selected 有遗漏也不会把动态内容漏回
+    # system（_render_system_prompt 的兜底是「（未选择角色/风格）」）。
+    rendered = _render_system_prompt(_static_selected(template), catalog, {})
     examples = _render_examples(skill.get("examples"))
     if examples:
         rendered = rendered.rstrip() + "\n\n示例：\n" + examples
     return rendered
+
+
+def _is_duplicate_system_block(user_block, skill_block):
+    """判断用户 system prompt 是否与 skill 正文重复（v4 P0 去重保险）。
+
+    典型触发场景：前端「恢复默认」按钮把默认文案（即 skill 原文）回填进
+    settings / ui holder，于是 ``config["system_prompt"]`` 恰好等于
+    ``skill["system_prompt"]`` —— 此时 user_block 与 skill_block 是同一份内容
+    的两次渲染，拼接后 system 里会出现两遍规则书（实测 10857 字符）。
+
+    判定条件（任一成立即视为重复）：
+    * 两者去空白后完全相等；
+    * ``skill_block`` 以 ``user_block`` 开头（skill_block = 同一正文 + few-shot）；
+    * 反过来 ``user_block`` 以 ``skill_block`` 开头。
+
+    注意：本函数只在 **skill 存在** 时被调用，不会影响 ``skill=None`` 的 v1 路径。
+    """
+    left = user_block.strip() if isinstance(user_block, str) else ""
+    right = skill_block.strip() if isinstance(skill_block, str) else ""
+    if not left or not right:
+        return False
+    if right == left:
+        return True
+    return right.startswith(left) or left.startswith(right)
 
 
 def build_messages(
@@ -713,11 +792,36 @@ def build_messages(
     * ``forbidden_tokens`` 非空时：在 user content 里显式列出「必须出现在 negative
       的压制词」——LLM 不知道要压什么就会偷懒漏词（实测 R2 覆盖率 0/11）；
     * ``skill=None`` 且 ``forbidden_tokens`` 为空时，输出与 v1 **逐字节一致**。
+
+    关于 prompt cache 的分层说明（v4 评估结论：**本函数不做分层**）:
+
+    已知 system 里可能含动态内容——skill / 用户 system prompt 里的
+    ``{{character_presets}}`` / ``{{style_presets}}`` / ``{{selected}}`` 占位符会被
+    :func:`_render_system_prompt` 渲染成实时内容。理论上把动态块挪到 user 末尾能让
+    system 更稳定，但这里**刻意不做**，原因：
+
+    1. 契约 §7 明文要求 ``skill=None`` 且 ``forbidden_tokens`` 为空时输出与 v1
+       逐字节一致，而用户自写的 system prompt 里完全可能出现这些占位符，
+       挪动位置会直接破坏这条约束；
+    2. 会改变内容在上下文中的位置，对输出准确率有不可控影响，与「准确率不能降」
+       这一硬约束冲突；
+    3. 实际用户场景里收益有限：``{{selected}}`` 只在**切换角色/风格**时变化，
+       同一角色反复重写时 system 本来就稳定；而「重试重复发送」这个真正的大头
+       已经在 :func:`nodes._build_retry_messages` 里解决掉了。
+
+    如果将来要做分层，正确的做法是**新增**一个显式的 ``stable_system`` /
+    ``dynamic_user_suffix`` 双参数版本，由调用方显式选择，而不是改变本函数的默认输出。
     """
     user_block = _render_system_prompt(system_prompt, catalog, selected)
     skill_block = _render_skill_prompt(skill, catalog, selected)
 
     if skill_block:
+        # v4 P0 去重保险：用户 system prompt 若与 skill 正文重复（典型场景是前端
+        # 把「恢复默认」的值回填进了 settings / ui holder，于是传入的 system_prompt
+        # 恰好等于 skill.system_prompt），只保留 skill_block，避免同一份规则书
+        # 在 system 里出现两次。
+        if user_block and _is_duplicate_system_block(user_block, skill_block):
+            user_block = ""
         # 契约 §14.2：用户可改风格（用户文本在前），skill 约束仍生效（条款在后）
         system_content = "\n\n".join(
             part for part in (user_block, skill_block) if part
