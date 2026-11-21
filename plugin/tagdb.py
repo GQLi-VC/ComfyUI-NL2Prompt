@@ -47,9 +47,11 @@ __all__ = [
     "CONF_EXACT",
     "CONF_ALIAS",
     "CONF_ALIAS_AMBIGUOUS",
+    "CONF_ALIAS_PROPER_NOUN",
     "CONF_PLURAL",
     "CONF_FTS",
     "CONF_FUZZY",
+    "AGENT_MIN_RATIO",
     "available",
     "status",
     "reload",
@@ -57,6 +59,8 @@ __all__ = [
     "normalize_token",
     "normalize_text",
     "search_zh",
+    "suggest_candidates",
+    "build_agent_feedback",
 ]
 
 # ---------------------------------------------------------------------------
@@ -1089,3 +1093,460 @@ def search_zh(query, limit=10):
     except Exception as exc:  # noqa: BLE001
         _warn("search_zh 异常（返回空）：%s" % exc)
         return []
+
+
+# ---------------------------------------------------------------------------
+# agent 工具：候选查询与反馈文本（v7）
+# ---------------------------------------------------------------------------
+#
+# 用户要的形态是「类似 agent 的功能」：LLM 出草稿 -> 标签库把**具体问题词 +
+# 库中真实合法的候选**反馈回去 -> LLM 自己决定采纳 / 换说法 / 保留。
+# 而不是插件在背后静默改写（那样 LLM 永远不知道自己的词有问题，
+# ``neon -> neon_(nikke)`` 就是静默改写的必然产物）。
+#
+# 关键约束：**候选必须只从 general(0) 类里找**。
+# ``neon`` 的别名候选是 ``neon_(nikke)``（角色名），把这种候选反馈给 LLM
+# 只会让它越改越错；它真正需要的候选是 ``neon_lights`` / ``neon_sign``。
+
+#: 触发 agent 第 2 轮的问题词占比下限（可被调用方覆盖）。
+AGENT_MIN_RATIO = 0.10
+
+#: 原词 + 这些后缀直接拼出来的通用标签（danbooru 里高频的组合写法）。
+_TAG_SUFFIXES = ("_lights", "_light", "_sign", "_signs", "_trim", "_news")
+
+#: 候选里要求的最低热度（避免把极冷门的词推荐给 LLM）。
+AGENT_MIN_POST_COUNT = 100
+
+#: 拆词时忽略的虚词（不参与覆盖率判断）。
+_AGENT_STOP_WORDS = frozenset((
+    "with", "and", "of", "the", "a", "an", "in", "on", "at", "for", "to",
+    "from", "by", "or", "as", "into", "over", "under", "very", "highly",
+))
+
+#: **长短语阈值**：拆词后有效词数达到这个值就**不给替换候选**。
+#:
+#: 为什么（真实事故）：``white thigh socks with gradient leg texture`` 这种自然
+#: 语言长短语，danbooru **本来就没有**对应的长标签。硬拆成 6 个词后随便命中
+#: 一个高频词就把候选塞进反馈，实测给出的是 ``white_background``（230 万热度）、
+#: ``gradient_hair``（22 万）、``texture`` —— 跟「白色渐变纹理大腿袜」毫无关系，
+#: LLM 一旦采纳画面彻底跑偏。这类词正确处理是明确告诉 LLM
+#: 「改用 2-3 个简短标准标签表达」。
+AGENT_MAX_CANDIDATE_WORDS = 4
+
+#: 短短语拆词时的**覆盖率**下限：候选至少要覆盖原词集合的这么多比例。
+AGENT_MIN_COVERAGE_RATIO = 0.5
+
+_AGENT_HEADER = "你输出的以下标签在 danbooru 标签库中不存在或写法不规范："
+_AGENT_FOOTER = "请只修正上述标签，其余标签保持不变，重新输出完整的 JSON。"
+_AGENT_TOO_LONG_HINT = (
+    "这是一个长短语，danbooru 没有与之对应的长标签。"
+    "请改用 2-3 个简短的标准标签来表达同样的意思，或直接删除它")
+
+
+def _agent_significant_words(key):
+    """把标签拆成「有信息量」的词（去停用词、去过短的词）。"""
+    words = []
+    for word in str(key).split("_"):
+        if len(word) >= 3 and word not in _AGENT_STOP_WORDS:
+            words.append(word)
+    return words
+
+
+def _agent_is_long_phrase(key):
+    """是不是长短语（长到不该给替换候选）。入参可以是原始 token 或已归一 key。"""
+    try:
+        normalized = normalization_key(key)
+    except Exception:  # noqa: BLE001 - 归一失败就按原串判断
+        normalized = str(key)
+    return len(_agent_significant_words(normalized)) >= AGENT_MAX_CANDIDATE_WORDS
+
+
+#: 主键自动索引名（``tag.name`` 是 PRIMARY KEY）。候选查询显式指定它，
+#: 否则优化器会选 ``(category, post_count)`` 索引从最热标签往下扫（慢 3 个数量级）。
+_PK_INDEX_NAME = "sqlite_autoindex_tag_1"
+_PK_INDEX_OK = None
+
+
+def _pk_index_available():
+    """主键自动索引是否可用（只查一次，结果缓存）。"""
+    global _PK_INDEX_OK
+    if _PK_INDEX_OK is None:
+        rows = _query(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (_PK_INDEX_NAME,))
+        _PK_INDEX_OK = bool(rows)
+    return bool(_PK_INDEX_OK)
+
+
+def _agent_rows(rows, limit, via=None):
+    """把查询结果统一成 ``[{"name","post_count","via"}]``，按热度降序。"""
+    result = []
+    for row in rows:
+        result.append({
+            "name": str(row["name"]),
+            "post_count": _to_int(row["post_count"]),
+        })
+    result.sort(key=lambda item: -item["post_count"])
+    if via:
+        for item in result:
+            item["via"] = via
+    return result[:max(int(limit), 1)]
+
+
+def _agent_prefix_candidates(key, limit, min_post_count, via):
+    """原词作为前缀（general 类）：``neon`` -> ``neon_lights`` / ``neon_trim``。
+
+    用**主键索引上的 name 范围扫描**，刻意不用 ``ORDER BY post_count``：
+    后者会让 SQLite 走 ``(category, post_count)`` 索引，从最热标签开始往下
+    扫、一直扫到凑够几个 ``neon_*`` 为止（实测 55 ms）；范围扫描只碰
+    ``neon_`` 开头的那几行（实测 0.004 ms），排序交给 Python 做。
+    """
+    params = (str(key) + "_", str(key) + "_\uffff", int(min_post_count))
+    if _pk_index_available():
+        rows = _query(
+            "SELECT name, post_count FROM tag INDEXED BY %s "
+            "WHERE name >= ? AND name < ? AND category = 0 AND post_count >= ? "
+            "LIMIT 200" % _PK_INDEX_NAME,
+            params)
+    else:
+        rows = _query(
+            "SELECT name, post_count FROM tag "
+            "WHERE name >= ? AND name < ? AND category = 0 AND post_count >= ? "
+            "LIMIT 200",
+            params)
+    return _agent_rows(rows, limit, via)
+
+
+def _agent_exact_candidates(names, via):
+    """一组精确标签名（general 类），按热度降序。
+
+    同样强制走主键索引：不加 ``INDEXED BY`` 时优化器会选
+    ``idx_tag_cat_count``（category + post_count），变成扫描全部 general
+    标签（实测 130 ms），加索引提示后是 0.01 ms 量级。
+    """
+    clean = [name for name in names if name]
+    if not clean:
+        return []
+    placeholders = ", ".join("?" for _ in clean)
+    hint = (" INDEXED BY %s" % _PK_INDEX_NAME) if _pk_index_available() else ""
+    rows = _query(
+        "SELECT name, post_count FROM tag%s "
+        "WHERE name IN (%s) AND category = 0" % (hint, placeholders),
+        tuple(clean))
+    return _agent_rows(rows, len(clean), via)
+
+
+def _agent_word_candidates(key, limit, min_post_count):
+    """多词标签**拆词**后逐词找合法候选：``steampunk elements`` -> ``steampunk``。
+
+    为什么需要：整串 ``steampunk_elements`` 在库里当然不存在，前缀、后缀、
+    词形、FTS 全部落空 —— 实测这就导致 5 个问题词一个候选都没有，反馈变成
+    干巴巴的"没有相近标签"，LLM 只能瞎换（``mechanical prosthetic arm`` 被
+    换成同样不存在的 ``cybernetic arm``）。拆成单词后 ``steampunk`` /
+    ``factory`` / ``arm`` 往往本身就是合法 general 标签，LLM 一眼就知道该往
+    哪个方向改。
+
+    每个词最多贡献 1 个候选，按「词在字符串里的长度」从长到短取，长的词信息
+    量更大（``prosthetic`` 比 ``arm`` 更能定位语义）。
+
+    **两条硬约束**（真实事故换来的）：
+
+    * **长短语直接放弃**：有效词数 >= ``AGENT_MAX_CANDIDATE_WORDS`` 时返回空。
+      ``white thigh socks with gradient leg texture`` 硬拆后会给
+      ``white_background``（230 万热度）这种泛词，跟原意毫无关系。
+    * **覆盖率约束**：候选必须覆盖原词集合的至少 ``AGENT_MIN_COVERAGE_RATIO``。
+      ``gradient leg texture`` 拆出来的 ``gradient_hair`` 只覆盖 ``gradient``
+      （1/3），会被过滤掉。
+    """
+    words = _agent_significant_words(key)
+    if len(words) < 2:
+        return []
+    if len(words) >= AGENT_MAX_CANDIDATE_WORDS:
+        return []
+    word_set = set(words)
+    words.sort(key=lambda word: -len(word))
+    # 覆盖率下限：2 词短语只需覆盖 1 个词，3 词及以上要求覆盖 2 个。
+    # （2 词短语如果也要求 2 个，steampunk elements -> steampunk 这种正确候选
+    #  就会被误杀 —— 实测踩过。）
+    required = max(1, int(round(len(word_set) * AGENT_MIN_COVERAGE_RATIO)))
+    required = min(required, len(word_set))
+    collected = []
+    seen = set()
+    for word in words:
+        if len(collected) >= max(int(limit), 1):
+            break
+        # 精确匹配原词里的某个词（优先级最高、语义最稳）
+        batch = [(item, True) for item in _agent_exact_candidates([word], "word")]
+        if not batch:
+            # 退而求其次：该词作为前缀扩展
+            batch = [(item, False)
+                     for item in _agent_prefix_candidates(word, 1,
+                                                          min_post_count, "word")]
+        for item, is_exact in batch:
+            name = item["name"]
+            if name in seen:
+                continue
+            covered = len(set(name.split("_")) & word_set)
+            if covered < required:
+                continue
+            # **前缀扩展必须覆盖 >= 2 个原词**：覆盖 1 个词的前缀扩展基本都是
+            # 语义跑偏的（cyborg arm -> arm_up「举手」、aurora lighting ->
+            # lighting_cigarette「点烟」），只有精确命中原词里那个词的才可信。
+            if not is_exact and covered < 2:
+                continue
+            seen.add(name)
+            collected.append(item)
+            break
+    return collected[:max(int(limit), 1)]
+
+
+def _agent_fts_candidates(key, limit):
+    """FTS5 前缀（**限 general 类**）：``thighhigh`` -> ``thighhighs``。"""
+    rows = _query(
+        "SELECT t.name AS name, t.post_count AS post_count "
+        "FROM tag_fts f JOIN tag t ON t.id = f.rowid "
+        "WHERE tag_fts MATCH ? AND t.category = 0 "
+        "ORDER BY t.post_count DESC LIMIT ?",
+        (_fts_prefix_expression(key), max(int(limit), 1) * 8))
+    return _agent_rows(rows, limit, "fts")
+
+
+def _agent_fuzzy_candidates(key, limit, min_post_count=1000):
+    """编辑距离 <= 2（**限 general 类且热度达标**），按距离、热度排序。
+
+    候选池用「首字符 + 长度区间」而**不是**前缀：拼写错误经常改掉第 2、3 个
+    字符（``purple_hair`` 写成 ``pruple_hair``），前缀预筛会直接把正确答案
+    漏掉。实测这个池子约 500 行、0.7 ms，足够便宜。
+    """
+    text = str(key)
+    if len(text) < 4:
+        return []
+    first = text[0]
+    if not ("a" <= first <= "z"):
+        return []
+    low = max(len(text) - 3, 3)
+    high = len(text) + 3
+    params = (first, chr(ord(first) + 1), int(min_post_count), low, high)
+    hint = (" INDEXED BY %s" % _PK_INDEX_NAME) if _pk_index_available() else ""
+    rows = _query(
+        "SELECT name, post_count FROM tag%s "
+        "WHERE name >= ? AND name < ? AND category = 0 AND post_count >= ? "
+        "AND length(name) BETWEEN ? AND ?" % hint,
+        params)
+    scored = []
+    for row in rows:
+        name = str(row["name"])
+        distance = _edit_distance(text, name, limit=2)
+        if distance <= 2:
+            scored.append((distance, -_to_int(row["post_count"]), name,
+                           _to_int(row["post_count"])))
+    if not scored:
+        return []
+    scored.sort()
+    return [{"name": item[2], "post_count": item[3], "via": "fuzzy"}
+            for item in scored[:max(int(limit), 1)]]
+
+
+def suggest_candidates(token, limit=3, min_post_count=AGENT_MIN_POST_COUNT):
+    """为「库里不存在 / 写法可疑」的词找 **LLM 能采纳的**合法候选。
+
+    只从 ``category = 0``（general）里找，理由见本节开头的说明。按以下顺序
+    依次尝试，**先命中的档位优先**（冷门档位只在前面的档位没结果时才用）：
+
+    ====== ================================================== ==========
+    档位   规则                                               示例
+    ====== ================================================== ==========
+    C1     原词 + ``_`` 作为前缀（主键范围扫描）               ``neon`` -> ``neon_lights``
+    C2     原词 + 常见后缀（``_lights`` / ``_sign`` ...）       ``neon`` -> ``neon_lights``
+    C3     词形归一（单复数互转）                              ``blue eye`` -> ``blue_eyes``
+    C4     FTS5 前缀（限 general）                             ``thighhigh`` -> ``thighhighs``
+    C5     编辑距离 <= 2（限 general 且 post_count >= 1000）   ``pruple_hair`` -> ``purple_hair``
+    ====== ================================================== ==========
+
+    C1/C4/C5 都带**近似匹配**性质，所以对「明显不是标签写法」的词
+    （``ethereal`` / ``8k`` / 典型幻觉词）一律不启用 —— 与 :func:`lookup`
+    里 L4/L5 的排除规则保持一致。否则会把 ``ethereal_(zenless_zone_zero)``
+    这种角色名当成"最接近的合法标签"推荐给 LLM，等于把老 bug 换个形式带回来。
+
+    :param token: 原始标签（可带权重语法 ``(x:1.2)``）
+    :param limit: 最多返回几个候选
+    :param min_post_count: C1/C2 的最低热度门槛
+    :returns: ``[{"name","post_count","via"}]``；找不到返回 ``[]``（绝不抛异常）
+    """
+    try:
+        if not token:
+            return []
+        key = normalization_key(token)
+        if not key:
+            return []
+        limit = max(int(limit), 1)
+
+        collected = []
+        seen = set()
+
+        def take(items):
+            for item in items:
+                name = item.get("name")
+                if not name or name in seen:
+                    continue
+                seen.add(name)
+                collected.append(item)
+
+        # 长短语：danbooru 没有对应的长标签，任何"最接近"的候选都只能是噪音
+        # （实测 white thigh socks with gradient leg texture ->
+        # white_background(230 万热度)）。直接不给候选，让上层提示改用简短标签。
+        if _agent_is_long_phrase(key):
+            return []
+
+        # 明显不是标签写法的词：只查确定性档位（词形），不做前缀/近似猜测
+        if _is_obvious_non_tag(key):
+            take(_agent_exact_candidates(_plural_variants(key), "plural"))
+            return collected[:limit]
+
+        # C1-C4 都很便宜（每个 0.01-0.1 ms），**全部跑完再按热度合并**。
+        # 不能"第一个命中的档位就返回"：thighhigh 的 C1 前缀会先命中冷门的
+        # thighhigh_gaiters(186)，而真正想要的 thighhighs(1.5M) 在 C3 词形里。
+        take(_agent_prefix_candidates(key, limit, min_post_count, "prefix"))
+        take(_agent_exact_candidates(
+            [key + suffix for suffix in _TAG_SUFFIXES], "suffix"))
+        take(_agent_exact_candidates(_plural_variants(key), "plural"))
+        take(_agent_fts_candidates(key, limit))
+        if collected:
+            collected.sort(key=lambda item: -_to_int(item.get("post_count")))
+            return collected[:limit]
+
+        # C5 编辑距离：整串拼写错误（pruple_hair -> purple_hair）。
+        # 必须排在拆词之前，否则 pruple_hair 会被拆词结果（hair_ornament，
+        # 热度 2M）抢先，而正确答案其实只差 2 个字符。
+        take(_agent_fuzzy_candidates(key, limit))
+        if collected:
+            collected.sort(key=lambda item: -_to_int(item.get("post_count")))
+            return collected[:limit]
+
+        # C4b 多词标签拆词兜底（steampunk elements -> steampunk / factory）
+        take(_agent_word_candidates(key, limit, min_post_count))
+        collected.sort(key=lambda item: -_to_int(item.get("post_count")))
+        return collected[:limit]
+    except Exception as exc:  # noqa: BLE001 - 候选查询失败不能影响重写
+        _warn("suggest_candidates 异常（返回空）：%s" % exc)
+        return []
+
+
+def _render_agent_feedback(problems):
+    """把问题清单渲染成给 LLM 看的中文反馈（标签名保持英文原名）。"""
+    lines = [_AGENT_HEADER, ""]
+    for item in problems:
+        token = item.get("token") or ""
+        kind = item.get("kind") or "unknown"
+        candidates = item.get("candidates") or []
+        if item.get("too_long"):
+            # 长短语单独措辞：明确说"没有对应长标签"，不要给误导性候选
+            head = "- `%s` %s。" % (
+                token, "的写法不规范" if kind == "suggest" else "不在库中")
+            lines.append(head + _AGENT_TOO_LONG_HINT)
+            continue
+        if kind == "suggest":
+            head = "- `%s` 的写法不规范。" % token
+        else:
+            head = "- `%s` 不在库中。" % token
+        if candidates:
+            described = "、".join(
+                "`%s`（%d 次使用）" % (candidate["name"],
+                                      _to_int(candidate.get("post_count")))
+                for candidate in candidates)
+            lines.append(head + "最接近的合法标签：" + described)
+        else:
+            lines.append(
+                head + "也没有相近的合法标签。请改用能表达相同含义的常见 "
+                "danbooru 标签，或直接删除它")
+    lines.append("")
+    lines.append(_AGENT_FOOTER)
+    return "\n".join(lines)
+
+
+def build_agent_feedback(summary, min_ratio=AGENT_MIN_RATIO, limit_per_token=3):
+    """根据 :func:`normalize_text` 的汇总，决定是否要发起 agent 第 2 轮。
+
+    触发条件（两条同时满足）：
+
+    1. 存在**问题词**：``unknown`` 里的词（库中不存在）或 ``suggestions``
+       里的词（库里有更标准的写法，但置信度不足以自动替换）。白名单里的词
+       （LoRA 触发词 / ``@画师`` / skill 质量词 / 本次注入词）根本不会进入这
+       两个列表，因此不会被当成"错误"反馈给 LLM。
+    2. 问题词占比 ``>= min_ratio``（默认 10%）。绝大多数正常输出（全对、
+       或只有一两个冷门词）都低于这个阈值，**不会**触发第二轮，
+       所以常态开销仍然是"只调用一次 LLM"。
+
+    :param summary: :func:`normalize_text` 的返回值
+    :param min_ratio: 问题词占比阈值
+    :param limit_per_token: 每个问题词最多给几个候选
+    :returns: ``{"triggered","reason","problem_ratio","problem_count",
+                 "total","problems","feedback"}``
+    """
+    result = {
+        "triggered": False,
+        "reason": "",
+        "problem_ratio": 0.0,
+        "problem_count": 0,
+        "total": 0,
+        "problems": [],
+        "feedback": "",
+    }
+    try:
+        if not isinstance(summary, dict):
+            result["reason"] = "bad_summary"
+            return result
+        stats = summary.get("stats") if isinstance(summary.get("stats"), dict) else {}
+        total = _to_int(stats.get("total"))
+        result["total"] = total
+        if total <= 0:
+            result["reason"] = "no_tokens"
+            return result
+
+        problems = []
+        seen = set()
+        for kind, bucket in (("unknown", summary.get("unknown")),
+                             ("suggest", summary.get("suggestions"))):
+            for item in bucket or []:
+                if not isinstance(item, dict):
+                    continue
+                token = str(item.get("input") or "").strip()
+                key = normalization_key(token)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                too_long = _agent_is_long_phrase(key)
+                problems.append({
+                    "token": token,
+                    "kind": kind,
+                    "reason": str(item.get("reason") or ""),
+                    # 长短语不给候选：任何"最接近"的候选都只能是噪音
+                    "too_long": too_long,
+                    "candidates": ([] if too_long else
+                                   suggest_candidates(token, limit=limit_per_token)),
+                })
+
+        result["problem_count"] = len(problems)
+        result["problems"] = problems
+        if not problems:
+            result["reason"] = "no_problem"
+            return result
+
+        ratio = len(problems) / float(total)
+        result["problem_ratio"] = round(ratio, 4)
+        try:
+            threshold = float(min_ratio)
+        except (TypeError, ValueError):
+            threshold = AGENT_MIN_RATIO
+        if ratio < threshold:
+            result["reason"] = "below_ratio"
+            return result
+
+        result["triggered"] = True
+        result["reason"] = "triggered"
+        result["feedback"] = _render_agent_feedback(problems)
+        return result
+    except Exception as exc:  # noqa: BLE001 - 反馈生成失败最多就是不触发
+        _warn("build_agent_feedback 异常（不触发）：%s" % exc)
+        result["reason"] = "internal_error"
+        return result

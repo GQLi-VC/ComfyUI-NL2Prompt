@@ -93,6 +93,11 @@ DEFAULT_PROMPT_OPT = {
     "dedupe_skill": True,
     "static_selected": True,
     "retry_multiturn": True,
+    # v7：标签库 agent 反馈。开启后，当 LLM 草稿里有「库中不存在」或「库里
+    # 有明显更标准写法」的标签**且问题词占比超过阈值**时，会把具体问题词 +
+    # 库中真实合法的候选一次性反馈给 LLM，让它自己再修一轮（上限 1 轮）。
+    # 关闭时完全回到旧行为：静默归一，不额外调用 LLM。
+    "tagdb_agent": True,
 }
 
 #: ``prompt_opt`` 各键的中文说明（供设置面板 / 日志使用，不含非 GBK 字符）
@@ -100,6 +105,7 @@ PROMPT_OPT_LABELS = {
     "dedupe_skill": "消除 skill 重复注入（关闭会显著增加 token 消耗）",
     "static_selected": "静态化 {{selected}}（关闭后换角色缓存失效）",
     "retry_multiturn": "重试多轮追加（关闭则重建 messages）",
+    "tagdb_agent": "标签库 agent 反馈（有问题时让 LLM 再修一轮，可能多一次调用）",
 }
 
 #: v6：thinking 模型「关思考」策略。

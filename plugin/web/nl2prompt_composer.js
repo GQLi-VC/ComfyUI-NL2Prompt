@@ -1013,10 +1013,27 @@ const UI_SETTINGS_CACHE = {
     // v5：提示词优化开关（缺键 = 显示开启）
     prompt_opt: { dedupe_skill: true, static_selected: true, retry_multiturn: true },
     prompt_opt_available: false,
+    // v5.1：模型思考模式（off / auto，缺键 = off，与后端默认一致）
+    thinking_mode: "off",
+    thinking_mode_available: false,
 };
 
-/** 「提示词优化」开关的三个键（与后端 store.DEFAULT_PROMPT_OPT 一致）。 */
-const PROMPT_OPT_KEYS = ["dedupe_skill", "static_selected", "retry_multiturn"];
+/** `thinking_mode` 合法取值（与后端 store.THINKING_MODES 一致）。 */
+const THINKING_MODES = ["off", "auto"];
+
+/** 归一化：只认 off / auto，其余（含缺键、类型异常）一律 off。 */
+function normalizeThinkingMode(value) {
+    const text = String(value === null || value === undefined ? "" : value).trim().toLowerCase();
+    return THINKING_MODES.includes(text) ? text : "off";
+}
+
+/**
+ * `prompt_opt` 的键（与后端 store.DEFAULT_PROMPT_OPT 一致，共 4 个）。
+ * 注意 `tagdb_agent` 不是"省 token"类开关，界面上单独放在「标签库」组，
+ * 因此渲染时只用 PROMPT_OPT_INLINE_KEYS，读写仍覆盖全部 4 个。
+ */
+const PROMPT_OPT_KEYS = ["dedupe_skill", "static_selected", "retry_multiturn", "tagdb_agent"];
+const PROMPT_OPT_INLINE_KEYS = ["dedupe_skill", "static_selected", "retry_multiturn"];
 
 /**
  * 归一化 prompt_opt：只有显式的假值才算关闭，缺键 / 类型异常一律视为开启。
@@ -1071,6 +1088,9 @@ async function ensureUiSettings(force = false) {
             // v5：后端支持后会回传 prompt_opt；没有这个键时按默认全开显示
             UI_SETTINGS_CACHE.prompt_opt_available = Object.prototype.hasOwnProperty.call(source, "prompt_opt");
             UI_SETTINGS_CACHE.prompt_opt = normalizePromptOpt(source.prompt_opt);
+            // v5.1：后端未返回 thinking_mode 时按 off 显示（与 store 默认值一致）
+            UI_SETTINGS_CACHE.thinking_mode_available = Object.prototype.hasOwnProperty.call(source, "thinking_mode");
+            UI_SETTINGS_CACHE.thinking_mode = normalizeThinkingMode(source.thinking_mode);
         }
         UI_SETTINGS_CACHE.loaded = true;
         UI_SETTINGS_CACHE.loading = null;
@@ -1122,6 +1142,44 @@ function buildGeneralTab(ctx, draft) {
     ));
     wrap.appendChild(positiveField);
 
+    // ---- 模型思考（v5.1：off / auto，直接影响重写能不能跑通，所以放在优化开关之前）
+    wrap.appendChild(createElement("div", "anima-nl-divider"));
+    wrap.appendChild(createElement("div", "anima-nl-field-label", t("composer.thinking.title")));
+    wrap.appendChild(createElement("div", "anima-nl-hint", t("composer.thinking.hint")));
+
+    const thinkingField = createElement("div", "anima-nl-field");
+    thinkingField.appendChild(createElement("label", "anima-nl-field-label", t("composer.thinking.label")));
+    const thinkingSelect = createElement("select", "anima-nl-select");
+    thinkingSelect.addEventListener("pointerdown", stopPointerEvent);
+    for (const [value, text] of [
+        ["off", t("composer.thinking.option_off")],
+        ["auto", t("composer.thinking.option_auto")],
+    ]) {
+        const option = createElement("option", null, text);
+        option.value = value;
+        thinkingSelect.appendChild(option);
+    }
+    thinkingSelect.dataset.role = "thinking-mode";
+    thinkingSelect.value = normalizeThinkingMode(UI_SETTINGS_CACHE.thinking_mode);
+    thinkingField.appendChild(thinkingSelect);
+    thinkingField.appendChild(createElement("div", "anima-nl-hint", t("composer.thinking.local_only")));
+    wrap.appendChild(thinkingField);
+
+    const thinkingUnavailable = createElement("div", "anima-nl-hint", t("composer.thinking.unavailable"));
+    thinkingUnavailable.dataset.role = "thinking-unavailable";
+    thinkingUnavailable.style.display = UI_SETTINGS_CACHE.thinking_mode_available ? "none" : "";
+    wrap.appendChild(thinkingUnavailable);
+
+    /** 读取思考模式下拉的当前值。 */
+    function readThinkingMode() {
+        return normalizeThinkingMode(thinkingSelect.value);
+    }
+
+    /** 用后端值回填思考模式（缺键 → off）。 */
+    function applyThinkingMode(value) {
+        thinkingSelect.value = normalizeThinkingMode(value);
+    }
+
     // ---- 提示词优化（v5：省 token 的三个开关）
     wrap.appendChild(createElement("div", "anima-nl-divider"));
     wrap.appendChild(createElement("div", "anima-nl-field-label", t("composer.prompt_opt.title")));
@@ -1143,7 +1201,7 @@ function buildGeneralTab(ctx, draft) {
         }
     }
 
-    for (const key of PROMPT_OPT_KEYS) {
+    for (const key of PROMPT_OPT_INLINE_KEYS) {
         const field = createElement("div", "anima-nl-field");
         const row = createElement("div", "anima-nl-switch-row");
         const checkbox = createElement("input", null);
@@ -1202,12 +1260,38 @@ function buildGeneralTab(ctx, draft) {
         }
     }
 
-    for (const key of PROMPT_OPT_KEYS) {
+    for (const key of PROMPT_OPT_INLINE_KEYS) {
         promptOptInputs[key].addEventListener("change", () => {
             const warn = promptOptWarns[key];
             if (warn) warn.style.display = promptOptInputs[key].checked ? "none" : "";
         });
     }
+
+    // ---- 标签库（v7：LLM 写出库外标签时，把库内最接近的合法候选反馈给它再修一轮）
+    wrap.appendChild(createElement("div", "anima-nl-divider"));
+    wrap.appendChild(createElement("div", "anima-nl-field-label", t("composer.tagdb.title")));
+
+    const tagdbField = createElement("div", "anima-nl-field");
+    const tagdbRow = createElement("div", "anima-nl-switch-row");
+    const tagdbCheckbox = createElement("input", null);
+    tagdbCheckbox.type = "checkbox";
+    tagdbCheckbox.id = "anima-nl-tagdb-agent";
+    tagdbCheckbox.dataset.optKey = "tagdb_agent";
+    tagdbCheckbox.checked = UI_SETTINGS_CACHE.prompt_opt.tagdb_agent !== false;
+    tagdbCheckbox.addEventListener("pointerdown", stopPointerEvent);
+    const tagdbLabel = createElement("label", null, t("composer.tagdb.agent"));
+    tagdbLabel.htmlFor = tagdbCheckbox.id;
+    tagdbLabel.addEventListener("click", (event) => {
+        event.preventDefault();
+        tagdbCheckbox.checked = !tagdbCheckbox.checked;
+        emitChange(tagdbCheckbox);
+    });
+    tagdbRow.append(tagdbCheckbox, tagdbLabel);
+    tagdbField.appendChild(tagdbRow);
+    tagdbField.appendChild(createElement("div", "anima-nl-hint", t("composer.tagdb.agent_hint")));
+    tagdbField.appendChild(createElement("div", "anima-nl-hint", t("composer.tagdb.agent_cost")));
+    wrap.appendChild(tagdbField);
+    promptOptInputs.tagdb_agent = tagdbCheckbox;
 
     // ---- 保存
     const actions = createElement("div", "anima-nl-actions");
@@ -1226,6 +1310,8 @@ function buildGeneralTab(ctx, draft) {
             default_positive_base: positiveInput.value,
             // v5：跟着同一条 settings_ui 保存链路走，不另开路由
             prompt_opt: readPromptOpt(),
+            // v5.1：模型思考 off / auto
+            thinking_mode: readThinkingMode(),
         };
         const previousLocale = normalizeLocale(UI_SETTINGS_CACHE.ui_locale);
         saveButton.disabled = true;
@@ -1242,6 +1328,7 @@ function buildGeneralTab(ctx, draft) {
         UI_SETTINGS_CACHE.ui_locale = payload.ui_locale;
         UI_SETTINGS_CACHE.default_positive_base = payload.default_positive_base;
         UI_SETTINGS_CACHE.prompt_opt = payload.prompt_opt;
+        UI_SETTINGS_CACHE.thinking_mode = payload.thinking_mode;
         if (kind === "locale") {
             // 先切语言再写状态：这条消息本身也要用新语言渲染
             if (previousLocale !== payload.ui_locale) applyLocale(payload.ui_locale);
@@ -1268,6 +1355,8 @@ function buildGeneralTab(ctx, draft) {
         positiveInput.value = cache.default_positive_base;
         applyPromptOpt(cache.prompt_opt);
         promptOptUnavailable.style.display = cache.prompt_opt_available ? "none" : "";
+        applyThinkingMode(cache.thinking_mode);
+        thinkingUnavailable.style.display = cache.thinking_mode_available ? "none" : "";
         if (cache.ok && normalizeLocale(cache.ui_locale) !== currentMode()) applyLocale(cache.ui_locale);
         ctx.setStatus(
             cache.ok
@@ -1291,6 +1380,8 @@ function buildGeneralTab(ctx, draft) {
         positiveInput.value = cache.default_positive_base;
         applyPromptOpt(cache.prompt_opt);
         promptOptUnavailable.style.display = cache.prompt_opt_available ? "none" : "";
+        applyThinkingMode(cache.thinking_mode);
+        thinkingUnavailable.style.display = cache.thinking_mode_available ? "none" : "";
         if (!cache.ok) {
             ctx.setStatus(t("composer.general.unavailable", { error: cache.error || "network" }), "error");
         }

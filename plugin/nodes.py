@@ -1586,6 +1586,10 @@ PROMPT_OPT_DEFAULTS = {
     "dedupe_skill": True,
     "static_selected": True,
     "retry_multiturn": True,
+    # v7：标签库 agent 反馈。开启后，当 LLM 草稿里的问题词占比超过阈值时，
+    # 把「具体问题词 + 库中真实合法的候选」追加成一轮反馈，让 LLM 自己修；
+    # 关闭时完全回到旧行为（静默归一，不额外调用 LLM）。
+    "tagdb_agent": True,
 }
 
 
@@ -1742,6 +1746,16 @@ def _tagdb_default_confidence():
         return 0.85
 
 
+def _tagdb_agent_min_ratio():
+    """取 tagdb 模块的 agent 触发阈值；模块不可用时用 10% 兜底。"""
+    value = getattr(_tagdb_mod, "AGENT_MIN_RATIO", None)
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        return 0.10
+    return ratio if 0.0 < ratio <= 1.0 else 0.10
+
+
 def _tagdb_whitelist(core, skill):
     """本次「插件自己拼进提示词的词」+ skill 质量词：一律免校验。
 
@@ -1835,6 +1849,197 @@ def _apply_tagdb(positive, ui, core, skill):
         _log(f"tagdb 校验异常（已跳过，提示词保持原样）：{type(exc).__name__}: {exc}")
         debug["reason"] = "internal_error"
         return positive, debug
+
+
+def _build_tagdb_agent_messages(messages, assistant_text, feedback):
+    """标签库 agent 第 2 轮的 messages：**只追加、不改写前缀**。
+
+    结构与 :func:`_build_retry_messages` 完全一致::
+
+        [system, user, assistant(上一轮输出), user(标签库反馈)]
+
+    所以 ``[system, user]`` 这个前缀与首次请求逐字节相同，prompt cache 仍然
+    命中（这正是 ``prompt_opt.retry_multiturn`` 那套设计，不另起一套）。
+
+    :returns: 新 messages；入参非法或反馈为空时**原样返回**入参
+    """
+    if not isinstance(messages, list) or not messages:
+        return messages
+    if not isinstance(feedback, str) or not feedback.strip():
+        return messages
+    appended = [dict(message) for message in messages]
+    text = assistant_text if isinstance(assistant_text, str) else ""
+    if text.strip():
+        appended.append({"role": "assistant", "content": text})
+    appended.append({"role": "user", "content": feedback})
+    return appended
+
+
+def _agent_token_keys(bucket):
+    """把 unknown / suggestions 列表压成小写 key 集合。"""
+    keys = set()
+    for item in _dicts(bucket):
+        key = _s(item.get("input")).strip().lower()
+        if key:
+            keys.add(key)
+    return keys
+
+
+def _agent_problem_total(tagdb_debug):
+    """一个问题清单的规模：``unknown`` + ``suggestions`` 的条数。"""
+    if not isinstance(tagdb_debug, dict):
+        return 0
+    return len(_dicts(tagdb_debug.get("unknown"))) \
+        + len(_dicts(tagdb_debug.get("suggestions")))
+
+
+def _agent_compare(plan, tagdb_after):
+    """对比「第 1 轮的问题词」与「第 2 轮的结果」，统计 LLM 的采纳情况。
+
+    ``resolved`` 只表示**原词消失了**，不代表它一定变成了合法标签 —— LLM 很
+    可能把 ``mechanical prosthetic arm`` 换成同样不存在的 ``cybernetic arm``
+    （实测确实发生过）。所以同时给出 ``new_problems`` 和 ``unknown_delta``，
+    看净效果才有意义。
+    """
+    summary = {
+        "resolved": [], "still": [], "new_problems": [],
+        "unknown_before": 0, "unknown_after": 0, "unknown_delta": 0,
+    }
+    try:
+        problems = _dicts(plan.get("problems"))
+        before = [str(p.get("token") or "") for p in problems]
+        before = [token for token in before if token.strip()]
+        summary["unknown_before"] = sum(
+            1 for item in problems if _s(item.get("kind")) == "unknown")
+        after = tagdb_after if isinstance(tagdb_after, dict) else {}
+        after_unknown = _dicts(after.get("unknown"))
+        summary["unknown_after"] = len(after_unknown)
+        summary["unknown_delta"] = summary["unknown_after"] - summary["unknown_before"]
+        after_keys = _agent_token_keys(after.get("unknown")) \
+            | _agent_token_keys(after.get("suggestions"))
+        for token in before:
+            (summary["still"] if token.strip().lower() in after_keys
+             else summary["resolved"]).append(token)
+        before_keys = set(token.strip().lower() for token in before)
+        summary["new_problems"] = sorted(
+            key for key in after_keys if key not in before_keys)
+        return summary
+    except Exception as exc:  # noqa: BLE001 - 统计失败只影响 debug
+        _log(f"agent 采纳统计失败（不影响结果）：{type(exc).__name__}: {exc}")
+        return summary
+
+
+def _run_tagdb_agent(
+    positive, negative, analysis, extra, parsed, tagdb_debug,
+    config, core, natural_language, view, skill, llm, ui, first_messages,
+    forbidden_tokens, enabled=True, min_ratio=0.10,
+):
+    """标签库 agent 第 2 轮：把「问题词 + 库中合法候选」反馈给 LLM，让它自己修。
+
+    硬约束（lead）：
+
+    * **只在该修的时候修**：问题词（``unknown`` + ``suggestions``）占比
+      低于 ``min_ratio`` 不触发 —— 绝大多数请求仍然只调用一次 LLM；
+    * **只追加 messages**：``[system, user, assistant, user]``，前缀逐字节不变，
+      prompt cache 有效；
+    * **绝不增加失败率**：第 2 轮任何异常 / 超时都回退第 1 轮结果
+      （它已经过 tagdb 归一），不因为 agent 环节挂掉导致整体重写失败；
+    * **上限 1 轮**，不做循环。
+
+    :returns: ``(positive, negative, analysis, extra, parsed, tagdb_debug,
+        agent_debug)``，7 元组与入参前 6 项同构
+    """
+    agent_debug = {
+        "enabled": bool(enabled),
+        "triggered": False,
+        "applied": False,
+    }
+    try:
+        if not enabled:
+            agent_debug["reason"] = "disabled"
+            return positive, negative, analysis, extra, parsed, tagdb_debug, agent_debug
+        if not isinstance(tagdb_debug, dict) or not tagdb_debug.get("available"):
+            agent_debug["reason"] = "tagdb_unavailable"
+            return positive, negative, analysis, extra, parsed, tagdb_debug, agent_debug
+        builder = getattr(_tagdb_mod, "build_agent_feedback", None)
+        if not callable(builder):
+            agent_debug["reason"] = "module_missing"
+            return positive, negative, analysis, extra, parsed, tagdb_debug, agent_debug
+
+        plan = builder(tagdb_debug, min_ratio=min_ratio)
+        plan = plan if isinstance(plan, dict) else {}
+        agent_debug["problem_ratio"] = plan.get("problem_ratio", 0.0)
+        agent_debug["problem_count"] = plan.get("problem_count", 0)
+        if not plan.get("triggered"):
+            agent_debug["reason"] = _s(plan.get("reason")) or "not_triggered"
+            return positive, negative, analysis, extra, parsed, tagdb_debug, agent_debug
+
+        agent_debug["triggered"] = True
+        agent_debug["min_ratio"] = min_ratio
+        agent_debug["feedback"] = plan.get("feedback") or ""
+        agent_debug["problems"] = [
+            {
+                "token": _s(item.get("token")),
+                "kind": _s(item.get("kind")),
+                "candidates": [
+                    _s(candidate.get("name"))
+                    for candidate in _dicts(item.get("candidates"))[:5]
+                ],
+            }
+            for item in _dicts(plan.get("problems"))
+        ]
+
+        messages = _build_tagdb_agent_messages(
+            first_messages, _retry_assistant_text(parsed), plan.get("feedback") or "")
+        if messages is first_messages:
+            agent_debug["reason"] = "no_messages"
+            return positive, negative, analysis, extra, parsed, tagdb_debug, agent_debug
+
+        # ---- 第 2 轮调用：任何失败都回退第 1 轮（绝不拖垮整体）
+        started = time.perf_counter()
+        try:
+            (positive2, negative2, analysis2, extra2, parsed2) = _call_llm_once(
+                natural_language, config, core, llm, view, skill,
+                messages=messages, forbidden_tokens=forbidden_tokens)
+        except LLMError as exc:
+            code = getattr(exc, "code", "llm_error")
+            _log(f"标签库 agent 第 2 轮失败（回退第 1 轮结果）：{code}")
+            agent_debug["fallback"] = True
+            agent_debug["error"] = _s(code)
+            return positive, negative, analysis, extra, parsed, tagdb_debug, agent_debug
+        except Exception as exc:  # noqa: BLE001
+            _log(f"标签库 agent 第 2 轮异常（回退第 1 轮结果）：{type(exc).__name__}: {exc}")
+            agent_debug["fallback"] = True
+            agent_debug["error"] = "llm_unexpected_error"
+            return positive, negative, analysis, extra, parsed, tagdb_debug, agent_debug
+
+        agent_debug["elapsed_ms"] = round((time.perf_counter() - started) * 1000.0, 2)
+
+        # 第 2 轮同样过一遍标签库（与首轮对称），再统计采纳情况
+        positive2, tagdb_debug2 = _apply_tagdb(positive2, ui, core, skill)
+        agent_debug.update(_agent_compare(plan, tagdb_debug2))
+
+        # ---- P1：**只有确实变好才采纳** ————
+        # "第 2 轮调用成功、但结果更差"这种情况必须兜住（真实事故：
+        # 某次输入第 1 轮 unknown=1，第 2 轮变成 2）。比较 unknown + suggestions
+        # 的总数，没有严格减少就整体回退第 1 轮结果。
+        before_total = _agent_problem_total(tagdb_debug)
+        after_total = _agent_problem_total(tagdb_debug2)
+        agent_debug["problem_total_before"] = before_total
+        agent_debug["problem_total_after"] = after_total
+        if after_total >= before_total:
+            _log("标签库 agent 第 2 轮没有改善（问题词 %d -> %d），已回退第 1 轮结果"
+                 % (before_total, after_total))
+            agent_debug["fallback"] = True
+            agent_debug["fallback_reason"] = "not_improved"
+            return positive, negative, analysis, extra, parsed, tagdb_debug, agent_debug
+
+        agent_debug["applied"] = True
+        return positive2, negative2, analysis2, extra2, parsed2, tagdb_debug2, agent_debug
+    except Exception as exc:  # noqa: BLE001 - agent 只是增强，绝不拖垮重写
+        _log(f"标签库 agent 异常（跳过反馈，保持第 1 轮结果）：{type(exc).__name__}: {exc}")
+        agent_debug["reason"] = "internal_error"
+        return positive, negative, analysis, extra, parsed, tagdb_debug, agent_debug
 
 
 def _merge_suppress_into_negative(llm_negative, forbidden_tokens, template_negative=""):
@@ -2205,6 +2410,21 @@ def _rewrite_only(llm, natural_language, ui, data=None, core=None):
     # 任何失败都降级为「原文不动」，只记录 debug.tagdb。
     positive, tagdb_debug = _apply_tagdb(positive, ui, core, skill)
 
+    # v7：标签库 agent 反馈轮 —— 把「具体问题词 + 库中合法候选」追加成一轮，
+    # 让 LLM 自己决定采纳 / 换说法 / 保留。只在问题词占比够高时触发（上限 1 轮），
+    # 第 2 轮失败一律回退第 1 轮结果（它已经过 tagdb 归一）。
+    (positive, negative, analysis, extra, parsed, tagdb_debug,
+     tagdb_agent_debug) = _run_tagdb_agent(
+        positive, negative, analysis, extra, parsed, tagdb_debug,
+        config, core, natural_language, view, skill, llm, ui, first_messages,
+        forbidden_tokens,
+        enabled=bool(prompt_options.get("tagdb_agent")),
+        min_ratio=_tagdb_agent_min_ratio(),
+    )
+    if isinstance(tagdb_debug, dict):
+        tagdb_debug = dict(tagdb_debug)
+        tagdb_debug["agent"] = tagdb_agent_debug
+
     # 契约 §14.2（lead 裁决）：**强制并入**模板的 outfit 抑制词，不依赖 LLM 自觉。
     # 必须在 check_anima 之前，让校验看到的就是最终值。
     negative, negative_missing = _merge_suppress_into_negative(
@@ -2274,7 +2494,12 @@ def _rewrite_only(llm, natural_language, ui, data=None, core=None):
             )
 
         # 重试结果同样先过标签库校验（与首轮对称），再强制合并抑制词
-        positive2, tagdb_debug = _apply_tagdb(positive2, ui, core, skill)
+        positive2, tagdb_debug_retry = _apply_tagdb(positive2, ui, core, skill)
+        if isinstance(tagdb_debug_retry, dict):
+            tagdb_debug_retry = dict(tagdb_debug_retry)
+            # agent 只跑一轮（首轮之后），这里保留它的观测结果不被覆盖
+            tagdb_debug_retry["agent"] = tagdb_agent_debug
+        tagdb_debug = tagdb_debug_retry
 
         # 重试结果同样强制合并抑制词
         negative2, negative_missing2 = _merge_suppress_into_negative(

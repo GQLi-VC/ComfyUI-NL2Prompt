@@ -1388,6 +1388,9 @@ async def _handle_settings_ui_get(request):
         "default_positive_base": str(settings.get("default_positive_base") or ""),
         "default_negative_base": str(settings.get("default_negative_base") or ""),
         "prompt_opt": prompt_opt,
+        # thinking_mode：off = 对本地端点发 reasoning_effort=none 关掉思考，
+        # auto = 不发送该字段。缺键按 off 返回，与 store 的默认值一致。
+        "thinking_mode": str(settings.get("thinking_mode") or "off"),
     }
 
 
@@ -1425,12 +1428,22 @@ async def _handle_settings_ui_post(request):
             )
         # 只透传，逐键的类型归一与已知键过滤由 store.save_settings 负责
         patch["prompt_opt"] = value
+    if "thinking_mode" in body:
+        value = body.get("thinking_mode")
+        value = value.strip().lower() if isinstance(value, str) else ""
+        if value not in ("off", "auto"):
+            return _error(
+                "bad_request",
+                "thinking_mode 只能是 off / auto",
+                "thinking_mode must be off or auto",
+            )
+        patch["thinking_mode"] = value
 
     if not patch:
         return _error(
             "bad_request",
-            "没有可更新的字段（支持 ui_locale / default_positive_base / prompt_opt）",
-            "No updatable fields (expected ui_locale / default_positive_base / prompt_opt)",
+            "没有可更新的字段（支持 ui_locale / default_positive_base / prompt_opt / thinking_mode）",
+            "No updatable fields (expected ui_locale / default_positive_base / prompt_opt / thinking_mode)",
         )
 
     module = _store_module()
