@@ -124,7 +124,7 @@ Switching language updates all of the following **instantly, with no page reload
 
 ```bash
 cd <your ComfyUI>/custom_nodes
-git clone https://github.com/GQLI-VC/NL2Prompt.git nl2prompt
+git clone https://github.com/GQLi-VC/ComfyUI-NL2Prompt.git nl2prompt
 ```
 
 Or just copy this whole directory into `custom_nodes/` and rename it to `nl2prompt`.
@@ -348,6 +348,6 @@ See [CONTRIBUTORS.md](CONTRIBUTORS.md) for who did what, human and AI.
 
 This document (the README, CHANGELOG and everything under `docs/`) was **written with AI assistance** and then reviewed and verified by hand — every screenshot is taken from the plugin actually running, and the feature descriptions are backed by automated tests.
 
-That said, UI layout, defaults and parameter names can shift between versions. **What actually matters is how the plugin behaves in your own ComfyUI** — treat the running instance as the source of truth. If you find the docs disagree with reality, please [open an issue](https://github.com/GQLI-VC/NL2Prompt/issues); that kind of feedback is especially valuable.
+That said, UI layout, defaults and parameter names can shift between versions. **What actually matters is how the plugin behaves in your own ComfyUI** — treat the running instance as the source of truth. If you find the docs disagree with reality, please [open an issue](https://github.com/GQLi-VC/ComfyUI-NL2Prompt/issues); that kind of feedback is especially valuable.
 
 > The fastest way to check that installation worked: drag in `workflows/NL2Prompt_v3_Direct.workflow.json` and run it.

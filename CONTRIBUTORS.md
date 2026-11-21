@@ -19,7 +19,7 @@ How the work was actually split:
 - **Human** — product decisions, hardware/environment setup, real-world verification (every screenshot comes from an actual run), accepting or rejecting each design trade-off, and the final review of everything that ships.
 - **AI** — writing code to spec, refactoring, generating tests and probe scripts, translating documentation between Chinese and English, and debugging (including several bugs that only surfaced under real use).
 
-Everything AI-produced was reviewed and tested before release. Bugs still happen — please [open an issue](https://github.com/GQLI-VC/NL2Prompt/issues) if you find one.
+Everything AI-produced was reviewed and tested before release. Bugs still happen — please [open an issue](https://github.com/GQLi-VC/ComfyUI-NL2Prompt/issues) if you find one.
 
 ---
 
@@ -44,4 +44,4 @@ Everything AI-produced was reviewed and tested before release. Bugs still happen
 - **人** —— 产品决策、硬件与环境搭建、真实环境验证（所有截图都来自真实运行）、每一项设计取舍的裁决，以及全部交付内容的最终审核。
 - **AI** —— 按规格写代码、重构、生成测试与探针脚本、中英文档互译，以及调试（包括几个只有在真实使用中才暴露的缺陷）。
 
-AI 产出的内容在发布前都经过了审核与测试。但缺陷仍然可能出现——如果发现问题，欢迎[提 Issue](https://github.com/GQLI-VC/NL2Prompt/issues)。
+AI 产出的内容在发布前都经过了审核与测试。但缺陷仍然可能出现——如果发现问题，欢迎[提 Issue](https://github.com/GQLi-VC/ComfyUI-NL2Prompt/issues)。

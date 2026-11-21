@@ -124,7 +124,7 @@ LLM 节点另有自己的设置窗口（Sampling / Cloud model / Local settings�
 
 ```bash
 cd <你的ComfyUI>/custom_nodes
-git clone https://github.com/GQLI-VC/NL2Prompt.git nl2prompt
+git clone https://github.com/GQLi-VC/ComfyUI-NL2Prompt.git nl2prompt
 ```
 
 或者直接把这个目录整个复制进 `custom_nodes/`，重命名为 `nl2prompt`。
@@ -348,6 +348,6 @@ Copyright (C) 2026 GQLI-VC
 
 本文档（含 README、CHANGELOG 与 `docs/` 下的说明）由 **AI 辅助撰写**，并经过人工核对与实测验证——文中所有截图均截自插件的真实运行界面，功能描述有对应的自动化测试覆盖。
 
-但界面布局、默认值、参数名可能随版本演进发生调整，**实际效果请以插件在你的 ComfyUI 中运行的结果为准**。如果发现文档与实机不符，欢迎提 [Issue](https://github.com/GQLI-VC/NL2Prompt/issues) 指正——这类反馈对项目尤其有价值。
+但界面布局、默认值、参数名可能随版本演进发生调整，**实际效果请以插件在你的 ComfyUI 中运行的结果为准**。如果发现文档与实机不符，欢迎提 [Issue](https://github.com/GQLi-VC/ComfyUI-NL2Prompt/issues) 指正——这类反馈对项目尤其有价值。
 
 > 验证安装是否成功最快的办法：直接拖入 `workflows/NL2Prompt_v3_Direct.workflow.json` 跑一遍。
