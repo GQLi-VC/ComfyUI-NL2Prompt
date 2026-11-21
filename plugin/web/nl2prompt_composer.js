@@ -47,6 +47,8 @@ import { currentMode, describeError, initI18n, setLocale, subscribeLocale, t } f
 const NODE_CLASSES = ["NL2PromptComposer", "AnimaNLComposer"];
 const NODE_CLASS = "NL2PromptComposer";
 const HOLDER_NAME = "_ui_json";
+// Python 侧声明的 BOOLEAN widget：新建节点默认开启「LLM 重写」。
+const USE_LLM_WIDGET = "use_llm";
 
 const MIN_WIDTH = 420;
 const WIDGET_MARGIN = 4;
@@ -331,15 +333,39 @@ function addBlockWidget(node, name, element, heightFn) {
     });
     widget.serialize = false;
     widget.computeSize = (width) => {
-        const nodeWidth = Number.isFinite(width) ? width : (node.size?.[0] ?? MIN_WIDTH);
+        // 宽度始终取「节点当前宽度」与传入宽度的较大值：
+        // 上游有时会传 0 / 旧宽度（node.computeSize() 从 [0,0] 起算），
+        // 若据此返回 MIN_WIDTH，DOM 容器就会被按窄宽度布局，表现为内容只占节点一半。
+        const nodeWidth = Math.max(
+            Number.isFinite(width) && width > 0 ? width : 0,
+            toNumber(node.size?.[0], MIN_WIDTH),
+            MIN_WIDTH,
+        );
         const height = Math.max(0, toNumber(heightFn?.(), 0));
-        return [Math.max(nodeWidth, MIN_WIDTH), height + 2 * (widget.margin ?? WIDGET_MARGIN)];
+        return [nodeWidth, height + 2 * (widget.margin ?? WIDGET_MARGIN)];
     };
     return widget;
 }
 
 function installComposer(node) {
     injectStyles();
+
+    // ---- 节点级 computeSize 兜底：ComfyUI 的默认实现只累加 widget 的高度，
+    // 宽度会退化成 NODE_WIDTH * 1.5（140 * 1.5 = 210）。任何用该宽度布局 DOM 的路径
+    // 都会把内容压成「节点一半宽」。这里保证宽度不小于节点当前宽度。
+    if (!node.__animaNlComputeSizePatched) {
+        const originalNodeComputeSize = node.computeSize;
+        node.computeSize = function (out) {
+            const result = originalNodeComputeSize?.call(this, out);
+            const width = Math.max(
+                toNumber(result?.[0], 0),
+                toNumber(this.size?.[0], 0),
+                MIN_WIDTH,
+            );
+            return [width, Math.max(1, toNumber(result?.[1], 1))];
+        };
+        node.__animaNlComputeSizePatched = true;
+    }
 
     // ---- 用同名 DOM holder 接管 Python 声明的 _ui_json（保持 widgets_values 的名称与顺序不变）
     let state = normalizeState(null);
@@ -439,6 +465,79 @@ function installComposer(node) {
 
     function fit() {
         fitNodeHeight(node, MIN_WIDTH);
+        scheduleWidthHeal();
+    }
+
+    // 兜底自愈：极少数重排路径会把 DOM 容器的 inline 宽度留成旧值/最小值，
+    // 表现为「自然语言处理以下的所有内容只有节点一半宽」。检测到偏差就用一次
+    // 尺寸抖动（+1px 再回退）逼框架重跑 DOM 布局，视觉上不可察觉。
+    //
+    // 防误抖 / 防抖动循环（正常尺寸下绝不能反复触发）：
+    //   1) 判定要同时满足「小于节点宽度的 85%」与「至少窄 8px」，避开亚像素与主题 padding 误差；
+    //   2) 必须连续两次采样（各隔一帧）都判窄才动手，瞬时测量误差不会触发；
+    //   3) 抖动进行中与抖动结束后 1.5s 冷却期内一律不再检测，且恢复尺寸后不再复查；
+    //   4) 折叠状态下跳过。
+    const HEAL_MIN_GAP_PX = 8;
+    const HEAL_COOLDOWN_MS = 1500;
+    let widthHealScheduled = false;
+    let widthHealInFlight = false;
+    let widthHealCooldownUntil = 0;
+    let widthHealStrikes = 0;
+
+    function isNarrowEnoughToHeal() {
+        const scale = toNumber(node.graph?.canvas?.ds?.scale, 1) || 1;
+        const width = Math.max(MIN_WIDTH, toNumber(node.size?.[0], MIN_WIDTH));
+        // 允许的最大宽度偏差：比例与绝对值取更严的那个
+        const threshold = Math.min(width * scale * 0.85, width * scale - HEAL_MIN_GAP_PX);
+        for (const widget of node.widgets) {
+            if (!widget?.element || widget.hidden) continue;
+            const rect = widget.element.getBoundingClientRect?.();
+            if (!rect || !(rect.width > 4)) continue;
+            if (rect.width < threshold) return true;
+        }
+        return false;
+    }
+
+    function scheduleWidthHeal() {
+        if (widthHealScheduled || widthHealInFlight) return;
+        if (Date.now() < widthHealCooldownUntil) return;
+        const raf = typeof requestAnimationFrame === "function" ? requestAnimationFrame : null;
+        if (!raf) return;
+        widthHealScheduled = true;
+        raf(() => {
+            widthHealScheduled = false;
+            if (widthHealInFlight || Date.now() < widthHealCooldownUntil) return;
+            if (!node.graph || node.flags?.collapsed) {
+                widthHealStrikes = 0;
+                return;
+            }
+            if (!isNarrowEnoughToHeal()) {
+                widthHealStrikes = 0;
+                return;
+            }
+            widthHealStrikes += 1;
+            if (widthHealStrikes < 2) {
+                // 下一帧再确认一次，避免瞬时测量误差触发抖动
+                scheduleWidthHeal();
+                return;
+            }
+            widthHealStrikes = 0;
+            widthHealInFlight = true;
+            const width = Math.max(MIN_WIDTH, toNumber(node.size?.[0], MIN_WIDTH));
+            const height = toNumber(node.size?.[1], 1);
+            node.setSize?.([width + 1, height]);
+            node.setDirtyCanvas?.(true, true);
+            raf(() => {
+                if (node.graph) {
+                    node.setSize?.([width, toNumber(node.size?.[1], height)]);
+                    node.setDirtyCanvas?.(true, true);
+                }
+                // 抖动结束后冷却，且不做「再检查一次再抖」——故障确实还在时，
+                // 由后续用户操作或下一轮 fit 在冷却期之后重试，绝不逐帧抖动。
+                widthHealCooldownUntil = Date.now() + HEAL_COOLDOWN_MS;
+                widthHealInFlight = false;
+            });
+        });
     }
 
     function arrange() {
@@ -1921,6 +2020,19 @@ app.registerExtension({
                 installComposer(this);
             } catch (error) {
                 console.error("[nl2prompt] 主节点 UI 安装失败（后端仍可用）", error);
+            }
+            try {
+                // 新建节点默认开启「LLM 重写」；加载/粘贴旧工作流时（app.configuringGraph）
+                // 不介入，仍由 widgets_values 里的历史值决定，旧工作流保持原来的关闭状态。
+                if (!app.configuringGraph) {
+                    const useLlmWidget = findWidget(this, USE_LLM_WIDGET);
+                    if (useLlmWidget && useLlmWidget.value === false) {
+                        useLlmWidget.value = true;
+                        this.setDirtyCanvas?.(true, true);
+                    }
+                }
+            } catch (error) {
+                console.error("[nl2prompt] use_llm 默认值设置失败", error);
             }
             return result;
         };

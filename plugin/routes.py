@@ -1006,6 +1006,11 @@ async def _handle_rewrite(request):
             "tagdb": debug.get("tagdb") if isinstance(debug.get("tagdb"), dict) else None,
             # 本次生效的 token 优化开关，便于排查"为什么没有省 token"
             "prompt_opt": debug.get("prompt_opt") if isinstance(debug.get("prompt_opt"), dict) else None,
+            # 中文清理：用户排查"为什么我的中文不见了"时需要
+            "cjk_cleaned": debug.get("cjk_cleaned"),
+            "cjk_removed_chars": debug.get("cjk_removed_chars"),
+            # 换装覆盖：用户排查"为什么原来的衣服没了/还在"时需要
+            "outfit_override": debug.get("outfit_override") if isinstance(debug.get("outfit_override"), dict) else None,
         },
     }
 

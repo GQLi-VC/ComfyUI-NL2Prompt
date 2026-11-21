@@ -25,6 +25,7 @@ import importlib.util
 import json
 import os
 import random
+import re
 import sys
 import time
 import traceback
@@ -539,6 +540,386 @@ def _dedupe_join(parts, sep=", "):
     return sep.join(ordered)
 
 
+#: 服装覆盖意图检测 —— **替换类**信号词（强意图：用户明确要改）
+_OUTFIT_REPLACE_WORDS = (
+    "换成", "改成", "换上", "换为", "换做", "改为", "替换为", "替成", "变成",
+    "change to", "switch to", "replace with", "instead of", "swap to",
+)
+
+#: 服装覆盖意图检测 —— **否定类**信号词（强意图：用户明确不要当前这身）
+_OUTFIT_NEGATE_WORDS = (
+    "不要", "不穿", "别穿", "去掉", "脱掉", "没有这身", "换了这身",
+    "without", "not wearing", "remove", "no longer",
+)
+
+#: **穿着描述类**词 —— 弱信号：不单独触发，但配合「颜色冲突」判据可以触发。
+#:
+#: 实测教训（2026-11-21）：把「穿」当**无条件**信号词会误触真实场景
+#: 「一个穿白色层叠长裙的银发少女回头看向镜头」—— 用户是在**描述当前选中的
+#: 服装**（假日皮肤就是层叠白裙），不是要换装，误触会把白裙标签删掉。
+#: 但完全放弃这类句式也不行：用户原话「用自然语言描述角色服装后没有覆盖掉
+#: 原本的服装」说的正是「让她穿一件黑色长裙」这种表述。
+#: 所以保留为**弱信号**，由「用户说的颜色与当前服装主色冲突」决定是否触发。
+_OUTFIT_WEAR_WORDS = (
+    "穿", "身着", "身穿", "套着", "披着",
+    "wearing", "dressed in", "put on",
+)
+
+#: 服装名词（中英）。只有它出现时才可能触发覆盖，避免「换成蓝眼睛」这类误触。
+_OUTFIT_NOUN_WORDS = (
+    "裙", "长裙", "短裙", "连衣裙", "礼服", "西装", "泳装", "泳衣", "校服", "制服",
+    "外套", "大衣", "和服", "睡衣", "女仆装", "旗袍", "汉服", "盔甲", "战袍", "衣服",
+    "dress", "skirt", "gown", "suit", "swimsuit", "bikini", "uniform", "serafuku",
+    "kimono", "coat", "jacket", "outfit", "clothes", "clothing", "armor", "lingerie",
+)
+
+#: 颜色词表（中英双语）-> 标准化英文色名。
+_OUTFIT_COLOR_ALIASES = {
+    "black": ("黑",),
+    "white": ("白",),
+    "red": ("红",),
+    "blue": ("蓝",),
+    "purple": ("紫",),
+    "green": ("绿",),
+    "yellow": ("黄",),
+    "pink": ("粉",),
+    "orange": ("橙",),
+    "gray": ("灰", "grey"),
+    "gold": ("金",),
+    "silver": ("银",),
+    "brown": ("棕",),
+    "cyan": ("青",),
+}
+
+#: 主服装核心词：只有含这些词的标签才代表「这套衣服的主色」。
+#: 用来排除配饰色与补充细节对判据的干扰 —— 流萤原皮是「白裙 + 黑手套」，
+#: 主色必须是 white，否则用户说「穿黑色长裙」时会因为黑手套"颜色一致"而漏检。
+_MAIN_GARMENT_WORDS = (
+    "dress", "skirt", "gown", "kimono", "suit", "uniform", "coat", "jacket",
+    "swimsuit", "bikini", "serafuku", "robe", "clothes", "outfit",
+)
+
+#: 排除「发色 / 瞳色」上下文，避免「紫发少女」被误当成"服装是紫色"。
+_BODY_COLOR_CONTEXT_RE = re.compile(
+    r"(黑|白|红|蓝|紫|绿|黄|粉|橙|灰|金|银|棕|青)色?\s*(?:发|头发|发丝|瞳|眼睛|眼眸|眼)"
+    r"|(?:black|white|red|blue|purple|green|yellow|pink|orange|gray|grey|gold"
+    r"|silver|brown|cyan)[\s_]+(?:hair|eyes|eyebrows)",
+    re.IGNORECASE,
+)
+
+
+#: 英文颜色词按**词边界**匹配：不能直接用子串 ``in``，
+#: 否则 ``layered dress`` 里的 ``red``、``orange`` 都会被误判成颜色
+#: （实测把遐蝶假日皮肤的主色识别成 {red, white}）。
+#: ``(?<![a-z])...(?:![a-z])`` 同时兼容 ``purple_dress`` 这种下划线连接写法。
+_EN_COLOR_RE = re.compile(
+    r"(?<![a-z])(black|white|red|blue|purple|green|yellow|pink|orange|gray|grey"
+    r"|gold|silver|brown|cyan)(?![a-z])")
+
+
+def extract_colors(text):
+    """从文本里提取颜色词，返回标准化英文色名集合。
+
+    会先剔掉「紫发 / 紫瞳 / purple hair / purple eyes」这类**身体部位**的颜色，
+    否则「紫发少女，穿黑色长裙」会被当成"用户想要紫色"，把换装意图吞掉。
+
+    :returns: ``{"black", "purple", ...}`` 形式的 set
+    """
+    if not isinstance(text, str) or not text.strip():
+        return set()
+    try:
+        cleaned = _BODY_COLOR_CONTEXT_RE.sub(" ", text.lower())
+        found = set()
+        # 英文：词边界匹配（避免 layered 里的 "red" 这种子串误判）
+        for match in _EN_COLOR_RE.finditer(cleaned):
+            word = match.group(1)
+            found.add("gray" if word == "grey" else word)
+        # 中文：单字匹配（中文字符不会和拉丁字母混淆）
+        for canonical, aliases in _OUTFIT_COLOR_ALIASES.items():
+            if any(alias in cleaned for alias in aliases):
+                found.add(canonical)
+        return found
+    except Exception as exc:  # noqa: BLE001
+        _log(f"extract_colors 异常（返回空）：{type(exc).__name__}: {exc}")
+        return set()
+
+
+def outfit_main_colors(outfit):
+    """提取当前服装的**主色**（只看含主服装核心词的标签）。
+
+    实测依据：流萤原皮的标签是 ``white dress, black hairband, black gloves`` ——
+    如果把所有标签的颜色都算进来，主色会变成 {white, black}，用户说
+    「穿黑色长裙」时会因为与黑手套"颜色一致"而漏检。只看主服装才对。
+
+    :returns: 颜色集合；这套服装没有可识别的颜色时返回空集
+    """
+    if not outfit:
+        return set()
+    try:
+        colors = set()
+        for word in _split_tokens(_first(outfit, _WORD_KEYS)):
+            lowered = str(word).lower()
+            if not any(core in lowered for core in _MAIN_GARMENT_WORDS):
+                continue
+            colors |= extract_colors(lowered)
+        return colors
+    except Exception as exc:  # noqa: BLE001
+        _log(f"outfit_main_colors 异常（返回空）：{type(exc).__name__}: {exc}")
+        return set()
+
+
+def detect_outfit_override(natural_language, outfit=None):
+    """检测自然语言里是否有「改服装」意图。
+
+    两条触发路径：
+
+    **路径 A — 强信号（替换 / 否定词）**：同时命中信号词和服装名词就触发。
+    ``换成黑色长裙`` / ``不要这身紫色的礼服`` / ``replace with a kimono``。
+
+    **路径 B — 穿着描述 + 颜色冲突**：``让她穿一件黑色长裙`` 这种句式没有
+    "替换"字样，但确实是换装要求（用户原话就是这个）。判据是
+    **用户说的颜色与当前服装主色完全不同**：
+
+    * ``穿一件黑色长裙`` + 原皮（``purple dress``）-> {black} vs {purple} 冲突 -> 触发
+    * ``穿白色层叠长裙`` + 假日皮肤（``white skirt``）-> {white} vs {white} 一致 -> 不触发
+
+    这样既救回用户的真实场景，又不会误删"描述当前服装"。
+
+    无颜色词（``穿一条裙子``）或当前服装识别不出主色时一律**不触发**
+    （宁可漏检，不误触）。
+
+    :param natural_language: 用户自然语言
+    :param outfit: 当前命中的服装 dict（可选；不传则路径 B 无法判定）
+    :returns: ``{"override","reason","matched","user_colors","outfit_colors"}``
+    """
+    result = {"override": False, "reason": "", "matched": [],
+              "user_colors": [], "outfit_colors": []}
+    try:
+        text = str(natural_language or "").strip().lower()
+        if not text:
+            result["reason"] = "empty"
+            return result
+        nouns = [word for word in _OUTFIT_NOUN_WORDS if word in text]
+        if not nouns:
+            result["reason"] = "no_outfit_noun"
+            return result
+
+        # ---- 路径 A：强信号（替换 / 否定）
+        signals = [word for word in _OUTFIT_REPLACE_WORDS if word in text]
+        signals += [word for word in _OUTFIT_NEGATE_WORDS if word in text]
+        if signals:
+            result.update({
+                "override": True,
+                "reason": "signal+noun",
+                "matched": signals[:2] + nouns[:2],
+            })
+            return result
+
+        # ---- 路径 B：穿着描述 + 颜色冲突
+        wear = [word for word in _OUTFIT_WEAR_WORDS if word in text]
+        if not wear:
+            result["reason"] = "no_signal_word"
+            result["matched"] = nouns[:2]
+            return result
+
+        user_colors = extract_colors(text)
+        result["user_colors"] = sorted(user_colors)
+        if not user_colors:
+            result["reason"] = "wear_no_color"
+            result["matched"] = wear[:1] + nouns[:1]
+            return result
+
+        current_colors = outfit_main_colors(outfit)
+        result["outfit_colors"] = sorted(current_colors)
+        if not current_colors:
+            result["reason"] = "outfit_no_color"
+            result["matched"] = wear[:1] + nouns[:1]
+            return result
+
+        if user_colors & current_colors:
+            result["reason"] = "color_match"
+            result["matched"] = sorted(user_colors & current_colors)
+            return result
+
+        result.update({
+            "override": True,
+            "reason": "color_conflict",
+            "matched": sorted(user_colors) + sorted(current_colors),
+        })
+        return result
+    except Exception as exc:  # noqa: BLE001 - 检测失败就按"不覆盖"处理
+        _log(f"detect_outfit_override 异常（按不覆盖处理）：{type(exc).__name__}: {exc}")
+        result["reason"] = "internal_error"
+        return result
+
+
+def split_body_and_clothing(character, outfit):
+    """把当前服装的标签拆成「角色主体特征」和「服装类」。
+
+    判据**不硬编码词表**，跟着数据走：同时出现在**角色** ``activation_words``
+    里的词算主体特征（发色 / 瞳色 / 发型 / 发饰），其余算服装类。
+
+    实测印证：流萤原皮的 ``black hairband`` 同时出现在角色 activation_words
+    里，所以换装时它会被保留；而遐蝶原皮的 ``strapless dress`` 等只在服装里，
+    会被覆盖。这正好符合「换裙子不是换发饰」的语义。
+
+    :returns: ``(body_tags, clothing_tags)``，各自保序去重
+    """
+    try:
+        character_words = {
+            token.lower()
+            for token in _split_tokens(_first(character, _WORD_KEYS))
+        } if character else set()
+        outfit_words = _split_tokens(_first(outfit, _WORD_KEYS))
+        outfit_words.extend(_split_tokens(_first(outfit, _PROMPT_KEYS)))
+        body = []
+        clothing = []
+        seen = set()
+        for word in outfit_words:
+            key = word.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            (body if key in character_words else clothing).append(word)
+        return body, clothing
+    except Exception as exc:  # noqa: BLE001 - 分类失败就当作全部是服装
+        _log(f"split_body_and_clothing 异常（按全部覆盖处理）：{type(exc).__name__}: {exc}")
+        return [], []
+
+
+#: 判定「positive 里有没有服装标签」用的核心词。
+#:
+#: 比 ``_MAIN_GARMENT_WORDS`` 更严格：**不含 clothes / outfit**，
+#: 否则 ``wet_clothes``（湿身效果，不是服装款式）会蒙混过关，
+#: 让"其实没画衣服"的输出逃过兜底。
+_GARMENT_TAG_WORDS = (
+    "dress", "skirt", "gown", "kimono", "suit", "uniform", "coat", "jacket",
+    "swimsuit", "bikini", "serafuku", "robe", "shirt", "blouse", "sweater",
+    "hoodie", "lingerie", "armor", "costume", "qipao", "cheongsam",
+)
+
+#: 中文服装名词 -> 英文基础标签（覆盖后兜底"补新服装"用）。
+#: 长词在前（``连衣裙`` 要压过 ``裙``）。
+_CN_GARMENT_TO_EN = (
+    ("连衣裙", "dress"),
+    ("长裙", "long dress"),
+    ("短裙", "short dress"),
+    ("晚礼服", "evening gown"),
+    ("礼服", "gown"),
+    ("西装", "suit"),
+    ("西服", "suit"),
+    ("泳装", "swimsuit"),
+    ("泳衣", "swimsuit"),
+    ("校服", "school uniform"),
+    ("制服", "uniform"),
+    ("风衣", "trench coat"),
+    ("外套", "coat"),
+    ("大衣", "coat"),
+    ("和服", "japanese clothes"),
+    ("睡衣", "pajamas"),
+    ("女仆装", "maid outfit"),
+    ("旗袍", "chinese clothes"),
+    ("汉服", "chinese clothes"),
+    ("盔甲", "armor"),
+    ("战袍", "armor"),
+    ("衬衫", "shirt"),
+    ("毛衣", "sweater"),
+    ("裙", "dress"),
+)
+
+#: 英文服装名词（用户直接写英文时用）。
+_EN_GARMENT_WORDS = (
+    "dress", "skirt", "gown", "suit", "swimsuit", "uniform", "kimono",
+    "coat", "jacket", "bikini", "shirt", "sweater",
+)
+
+
+def _lookup_garment_tag(candidate):
+    """用 tagdb 校验一个候选服装标签，返回标准写法（非 general 类拒收）。"""
+    lookup = getattr(_tagdb_mod, "lookup", None) if _tagdb_mod is not None else None
+    if not callable(lookup):
+        return ""
+    try:
+        hit = lookup(str(candidate))
+    except Exception:  # noqa: BLE001
+        return ""
+    if not isinstance(hit, dict) or not hit.get("hit"):
+        return ""
+    if hit.get("category") != 0:
+        return ""
+    name = _s(hit.get("name"))
+    return name if name else ""
+
+
+def _has_garment_tag(positive):
+    """positive 里是否已经出现服装类标签。"""
+    try:
+        for token in _split_tokens(positive):
+            lowered = str(token).lower()
+            if any(word in lowered for word in _GARMENT_TAG_WORDS):
+                return True
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def extract_garment_tags(natural_language, limit=2):
+    """从用户自然语言里提取「新服装」的英文标签（经 tagdb 校验）。
+
+    **用途（P0 兜底）**：覆盖触发时代码侧会删掉旧服装，如果 LLM 没有再写新服装，
+    结果就是"角色光着"—— 比"衣服不对"更糟。所以模板路径直接补、LLM 路径兜底补。
+
+    规则：
+      1. 颜色（:func:`extract_colors`）+ 服装名词组合优先：``黑色``+``长裙``
+         -> ``black dress`` / ``long dress``
+      2. 组合不合法再退回基础词（``dress`` / ``swimsuit`` / ...）
+      3. 每个候选都过 tagdb，**只收 general 类**的标准写法
+      4. 什么都找不到返回 ``[]``（调用方不要编造标签）
+
+    :returns: 最多 ``limit`` 个标准标签，保序去重
+    """
+    try:
+        text = str(natural_language or "")
+        if not text.strip():
+            return []
+        colors = sorted(extract_colors(text))
+        garments = []
+        for cn, en in _CN_GARMENT_TO_EN:
+            if cn in text:
+                garments.append(en)
+        lowered = text.lower()
+        for word in _EN_GARMENT_WORDS:
+            if re.search(r"(?<![a-z])" + word + r"(?![a-z])", lowered):
+                garments.append(word)
+        ordered = []
+        for item in garments:
+            if item and item not in ordered:
+                ordered.append(item)
+        if not ordered:
+            return []
+        # 长词优先（long dress 比 dress 更具体）
+        ordered.sort(key=lambda item: -len(item))
+
+        combinations = []
+        for color in colors:
+            for garment in ordered:
+                combinations.append(color + " " + garment)
+
+        picked = []
+        seen = set()
+        for candidate in combinations + ordered:
+            name = _lookup_garment_tag(candidate)
+            if name and name not in seen:
+                seen.add(name)
+                picked.append(name)
+            if len(picked) >= max(int(limit), 1):
+                break
+        return picked
+    except Exception as exc:  # noqa: BLE001 - 兜底失败就返回空，调用方保持原样
+        _log(f"extract_garment_tags 异常（返回空）：{type(exc).__name__}: {exc}")
+        return []
+
+
 def _float_or(value, default=1.0):
     try:
         number = float(value)
@@ -547,6 +928,54 @@ def _float_or(value, default=1.0):
     if number != number:  # NaN
         return default
     return number
+
+
+#: 中文 / 全角字符片段：CJK 标点(U+3000-303F)、汉字(U+3400-4DBF / U+4E00-9FFF)、
+#: 兼容汉字(U+F900-FAFF)、全角区(U+FF00-FFEF，含 `，` `：` `（）` 等)。
+#: 与 ``skill_check._CJK_RE`` 同一套取值，保证"中文"的判断口径一致。
+_CJK_SEGMENT_RE = re.compile(
+    r"[\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffef]+")
+
+#: 清理后可能残留的孤立标点（中英混排时中文被删、标点留在英文旁边）。
+_RESIDUAL_PUNCT = " \t,;:|，、。；：,./\\-+*_\"'`()[]{}<>"
+
+
+def strip_cjk_segments(text):
+    """把标签串里的**中文片段**剔除，只保留英文。
+
+    用途（lead 决策 B）：模板路径的 positive 会被直接送进 CLIP，而 CLIP 不懂
+    中文 —— 中文是纯噪声 token，还会让用户以为插件坏了。LLM 路径不用这个：
+    那边由 ``skill_check`` 的 ``contains_chinese`` 保证输出是英文。
+
+    边界规则：
+
+    * **只删中文，保留英文**：``"雨夜霓虹街头 black dress"`` -> ``"black dress"``
+    * 中文判定覆盖全角标点（``，`` ``。`` ``、`` ``（）`` ``：``），
+      中英混排不会留下孤立标点
+    * 清理收尾：连续逗号合并、首尾去标点、空白折叠（``re.sub(r"\\s+", " ")``）
+    * **全中文输入返回空串** —— 兜底由调用方负责（这里不塞默认标签，
+      保持函数纯粹、可单测）
+
+    :param text: 逗号分隔的标签串
+    :returns: 清理后的标签串；入参不是 ``str`` 时原样返回
+    """
+    if not isinstance(text, str):
+        return text
+    if not text.strip():
+        return ""
+    try:
+        pieces = []
+        for token in _split_tokens(text):
+            cleaned = _CJK_SEGMENT_RE.sub(",", token)
+            for piece in cleaned.split(","):
+                piece = piece.strip(_RESIDUAL_PUNCT)
+                piece = re.sub(r"\s+", " ", piece).strip()
+                if piece:
+                    pieces.append(piece)
+        return ", ".join(pieces)
+    except Exception as exc:  # noqa: BLE001 - 清理失败绝不能影响出图
+        _log(f"strip_cjk_segments 异常（原样返回）：{type(exc).__name__}: {exc}")
+        return text
 
 
 def _hash_params(payload):
@@ -1118,9 +1547,36 @@ def _compose_core(natural_language, ui, data=None):
                     debug["outfits"].append(outfit_name)
 
                 outfit_activation = _split_tokens(_first(outfit, _WORD_KEYS))
-                positive_parts.extend(outfit_activation)
-                positive_parts.extend(_split_tokens(_first(outfit, _PROMPT_KEYS)))
-                debug["injected_triggers"].extend(outfit_activation)
+                # v9 服装覆盖：用户自然语言明确描述了新服装时，当前预设服装的
+                # **服装类**标签不再注入 positive，改注入 negative 抑制；
+                # **角色主体特征**（发色/瞳色/发饰）必须保留 —— 换裙子不是换发饰。
+                # 检测不到覆盖意图时，走原有逻辑，行为一字不变。
+                override = detect_outfit_override(natural_language, outfit)
+                if override["override"]:
+                    body_tags, clothing_tags = split_body_and_clothing(character, outfit)
+                    positive_parts.extend(body_tags)
+                    debug["injected_triggers"].extend(body_tags)
+                    for word in clothing_tags:
+                        negative_parts.append(word)
+                        debug["negative_suppress_source"]["outfit"].append(word)
+                    # P0：删掉旧服装后**必须补上新服装**，否则角色会"光着"。
+                    # 模板路径没法靠 LLM 翻译中文，代码侧直接从用户描述提取。
+                    new_garments = extract_garment_tags(natural_language)
+                    positive_parts.extend(new_garments)
+                    debug["outfit_override"] = {
+                        "detected": True,
+                        "reason": override["reason"],
+                        "matched": override["matched"],
+                        "user_colors": override.get("user_colors") or [],
+                        "outfit_colors": override.get("outfit_colors") or [],
+                        "suppressed_clothing": clothing_tags,
+                        "kept_body": body_tags,
+                        "new_garments": new_garments,
+                    }
+                else:
+                    positive_parts.extend(outfit_activation)
+                    positive_parts.extend(_split_tokens(_first(outfit, _PROMPT_KEYS)))
+                    debug["injected_triggers"].extend(outfit_activation)
 
                 outfit_lora = _s(_first(outfit, _LORA_KEYS))
                 if outfit_lora:
@@ -1209,6 +1665,24 @@ def _compose_core(natural_language, ui, data=None):
 
     positive = _dedupe_join(positive_parts)
     negative = _dedupe_join(negative_parts)
+
+    # v9：模板路径 CJK 清理（lead 决策 B）。
+    # CLIP 不懂中文 —— positive 里的中文是纯噪声 token，还会让用户以为插件坏了。
+    # 只删中文片段、保留英文（用户可能写 "换成 black dress"）。
+    # LLM 路径不受影响：它的英文由 skill_check 保证；用户的**中文原始需求**仍通过
+    # `natural_language` 单独传给 messages，不依赖这里的 positive。
+    positive_raw = positive
+    positive_cleaned = strip_cjk_segments(positive)
+    if positive_cleaned != positive_raw:
+        debug["cjk_cleaned"] = True
+        if not positive_cleaned:
+            # 全中文且没有任何结构化标签（没选角色/风格）时，
+            # 回退到基础词，**绝不输出空串**。
+            positive_cleaned = (positive_base or "").strip() or "1girl"
+            debug["cjk_fallback"] = True
+        else:
+            debug["cjk_removed_chars"] = len(positive_raw) - len(positive_cleaned)
+        positive = positive_cleaned
 
     # 注入词去重（保留顺序）
     debug["injected_triggers"] = [
@@ -1929,6 +2403,42 @@ def _agent_compare(plan, tagdb_after):
         return summary
 
 
+def _ensure_garment_after_override(positive, core):
+    """覆盖触发后，保证 positive 至少有一个服装标签（P0 兜底）。
+
+    背景（lead 复验发现）：覆盖会删掉旧服装，如果 LLM 没有写新服装，
+    输出就变成"角色光着"——**比"衣服不对"更糟**。所以这里做一层兜底：
+    LLM 已经写了服装 -> 不动；没写 -> 用 ``_compose_core`` 提前算好的
+    ``new_garments`` 补上（那是经 tagdb 校验的标准写法）。
+
+    :returns: ``(positive, info)``，``info["supplemented"]`` 表示是否补过
+    """
+    info = {"supplemented": False, "added": []}
+    try:
+        core_debug = core.get("debug") if isinstance(core, dict) else {}
+        core_debug = core_debug if isinstance(core_debug, dict) else {}
+        override = core_debug.get("outfit_override")
+        if not isinstance(override, dict) or not override.get("detected"):
+            return positive, info
+        if _has_garment_tag(positive):
+            return positive, info
+        supplement = [word for word in (override.get("new_garments") or []) if word]
+        if not supplement:
+            return positive, info
+        text = str(positive).strip().rstrip(",").strip()
+        merged = (text + ", " + ", ".join(supplement)) if text \
+            else ", ".join(supplement)
+        info["supplemented"] = True
+        info["added"] = supplement
+        _log("标签库 agent 前置兜底：覆盖后 LLM 未写服装，已补 %s"
+             % ", ".join(supplement))
+        return merged, info
+    except Exception as exc:  # noqa: BLE001 - 兜底失败就保持原样
+        _log(f"_ensure_garment_after_override 异常（保持原样）："
+             f"{type(exc).__name__}: {exc}")
+        return positive, info
+
+
 def _run_tagdb_agent(
     positive, negative, analysis, extra, parsed, tagdb_debug,
     config, core, natural_language, view, skill, llm, ui, first_messages,
@@ -2410,6 +2920,19 @@ def _rewrite_only(llm, natural_language, ui, data=None, core=None):
     # 任何失败都降级为「原文不动」，只记录 debug.tagdb。
     positive, tagdb_debug = _apply_tagdb(positive, ui, core, skill)
 
+    # v9 P0 兜底：服装覆盖触发后，若 LLM 没写新服装就补上。
+    # 不补的后果是"旧衣服删了、新衣服没有"，角色光着 —— 比衣服不对更糟。
+    positive, garment_info = _ensure_garment_after_override(positive, core)
+    if garment_info.get("supplemented"):
+        if isinstance(tagdb_debug, dict):
+            tagdb_debug = dict(tagdb_debug)
+        core_override = (core.get("debug") or {}).get("outfit_override") or {}
+        if isinstance(core_override, dict):
+            tagdb_debug["outfit_override"] = dict(core_override)
+            tagdb_debug["outfit_override"]["garment_supplemented"] = True
+            tagdb_debug["outfit_override"]["supplemented_tags"] = \
+                garment_info.get("added") or []
+
     # v7：标签库 agent 反馈轮 —— 把「具体问题词 + 库中合法候选」追加成一轮，
     # 让 LLM 自己决定采纳 / 换说法 / 保留。只在问题词占比够高时触发（上限 1 轮），
     # 第 2 轮失败一律回退第 1 轮结果（它已经过 tagdb 归一）。
@@ -2557,6 +3080,19 @@ def _rewrite_only(llm, natural_language, ui, data=None, core=None):
         # v5：本轮生效的提示词优化开关（便于对照排查）
         "prompt_opt": prompt_options,
     }
+    # v9：把模板侧的清理/覆盖观测项透出到 /rewrite 的 debug。
+    # `_compose_core` 的 debug 只进节点输出，走 /rewrite（_rewrite_only）会丢，
+    # 用户排查「我的中文怎么不见了」时需要看得见。
+    _core_debug = core.get("debug") if isinstance(core, dict) else {}
+    if isinstance(_core_debug, dict):
+        for _key in ("cjk_cleaned", "cjk_removed_chars", "cjk_fallback",
+                     "outfit_override"):
+            if _key in _core_debug:
+                debug[_key] = _core_debug[_key]
+    # 覆盖兜底的信息在 tagdb_debug 里更全（含 garment_supplemented），优先用它
+    if isinstance(tagdb_debug, dict) and isinstance(
+            tagdb_debug.get("outfit_override"), dict):
+        debug["outfit_override"] = tagdb_debug["outfit_override"]
     debug.update(extra)
     return {
         "ok": True,
@@ -2958,13 +3494,18 @@ class NL2PromptComposer:
     def compose(
         self,
         natural_language="",
-        use_llm=False,
+        use_llm=True,
         _ui_json="{}",
         llm=None,
         clip=None,
         model=None,
     ):
         # clip 按契约 §1.2 预留：接受但不参与组装
+        # v9：use_llm 默认改为 True（用户要求）。
+        # 这是**节点新建时的默认值**；已保存的工作流会把 widgets_values 里的
+        # 值（可能是 false）作为参数传进来，ComfyUI 的参数绑定优先于签名默认值，
+        # 所以老工作流行为不变。
+        # llm 未连接时仍会安全回退模板（见 _compose_with_llm_into）。
         ui = _parse_json_obj(_ui_json)
 
         try:
@@ -3042,7 +3583,9 @@ class NL2PromptComposer:
         }
 
     @classmethod
-    def IS_CHANGED(cls, natural_language="", use_llm=False, _ui_json="{}", **kwargs):
+    def IS_CHANGED(cls, natural_language="", use_llm=True, _ui_json="{}", **kwargs):
+        # v9：use_llm 默认 True，与 compose 签名保持一致（否则新建节点
+        # 首帧会被误判为"参数已变化"而重复执行）。
         ui = _parse_json_obj(_ui_json)
         sampling = ui.get("sampling") if isinstance(ui.get("sampling"), dict) else {}
         try:
