@@ -333,8 +333,18 @@ def build_payload(cfg, messages):
         "model": _as_str(cfg.get("model")),
         "messages": messages,
         "stream": False,
-        "response_format": {"type": "json_object"},
     }
+
+    # 刻意**不发送** ``response_format``。
+    #
+    # OpenAI 标准允许 ``{"type": "json_object"}``，但不少 OpenAI 兼容实现并不认：
+    # 新版 LM Studio 只接受 ``text`` / ``json_schema``，发 ``json_object`` 直接回
+    #   400 {"error":"'response_format.type' must be 'json_schema' or 'text'"}
+    # llama.cpp 的 server 与部分第三方网关也有类似限制。
+    #
+    # 而 system prompt 里本来就写死了「只输出 JSON：{...}」，``extract_content`` 到
+    # ``parse_json_loose`` 那一层也能剥 ```json 代码围栏。所以发这个字段只增加
+    # 不兼容面，不增加可靠性。
 
     temperature = _clamp(sampling.get("temperature", 0.7), 0.0, 2.0, 0.7)
     top_p = _clamp(sampling.get("top_p", 0.9), 0.0, 1.0, 0.9)

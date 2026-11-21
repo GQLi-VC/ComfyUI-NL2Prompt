@@ -410,6 +410,68 @@ function applyModelChoices(node, values) {
     node.setDirtyCanvas?.(true, true);
 }
 
+/* ---------------- 加载工作流后补齐 model_file 选项 ---------------- */
+
+/**
+ * 重启 ComfyUI 后补齐 `model_file` 的选项。
+ *
+ * 后端 `INPUT_TYPES` 刻意不预扫描（启动快、不碰磁盘），所以 COMBO 的 options
+ * 只有占位项。而工作流里存着上次选好的模型文件名，ComfyUI 在提交时会做 COMBO
+ * 校验，于是报：
+ *
+ *     Value not in list: model_file: 'xxx.gguf' not in ['(请先选择路径后刷新)']
+ *     → invalid prompt: prompt_outputs_failed_validation
+ *
+ * 用户看到的就是「模型不存在，要重下」。这里在加载工作流后静默补扫一次。
+ */
+async function ensureModelChoices(node) {
+    const widget = findWidget(node, "model_file");
+    if (!widget) return;
+    const current = String(widget.value ?? "").trim();
+    if (isModelPlaceholder(current)) return;
+
+    // 判断「是否还没扫过」：列表里除了占位项和当前值之外还有别的模型，说明已经扫过。
+    // 不能只看 `values.includes(current)`——keepCurrentModelChoice 会先把当前值塞进去，
+    // 那样这里会立刻 return，扫描永远不会发生。
+    const values = widget.options?.values;
+    if (Array.isArray(values)) {
+        const others = values.filter((v) => !isModelPlaceholder(v) && String(v).trim() !== current);
+        if (others.length > 0) return;
+    }
+
+    const rootPath = widgetText(node, modelRootWidgetName(node)).trim();
+    if (!rootPath) return;
+    try {
+        const response = await apiGet(`${scanEndpoint(node)}?path=${encodeURIComponent(rootPath)}`);
+        if (!response.ok) return;
+        const data = response.data ?? {};
+        if (data.error) return;
+        const files = Array.isArray(data.files) ? data.files : [];
+        const choices = [];
+        for (const item of files) {
+            const name = String(item?.name ?? "").trim();
+            if (!name) continue;
+            const dir = String(item?.dir ?? "").trim().replace(/^[\\/]+|[\\/]+$/g, "");
+            choices.push(dir ? `${dir}/${name}` : name);
+        }
+        if (choices.length) applyModelChoices(node, choices);
+    } catch (error) {
+        console.error("[nl2prompt] 自动补齐模型列表失败", error);
+    }
+}
+
+/** 先把当前值塞进 options，保证即使扫描还没回来、提交也不会被 COMBO 校验拦下。 */
+function keepCurrentModelChoice(node) {
+    const widget = findWidget(node, "model_file");
+    if (!widget) return;
+    const current = String(widget.value ?? "").trim();
+    if (isModelPlaceholder(current)) return;
+    if (!widget.options || typeof widget.options !== "object") widget.options = {};
+    if (!Array.isArray(widget.options.values)) widget.options.values = [t("llm.model_file.placeholder")];
+    if (!widget.options.values.includes(current)) widget.options.values.push(current);
+}
+
+
 /**
  * 后端 INPUT_TYPES 声明的原生 widget → i18n key（只用于显示文案：tooltip）。
  * 取值（COMBO / BOOLEAN 的 value）一律原样，不参与翻译。
@@ -528,6 +590,7 @@ function installLoadLlm(node) {
         flashButton(t("llm.scan.found", { count: choices.length }), "ok");
         changed();
     }
+
 
     /* ---------------- 云端：只读模型小字（拉取模型已移入「LLM 设置」窗口） ---------------- */
 
@@ -1569,6 +1632,12 @@ app.registerExtension({
                 controller.applyProviderTable();
                 controller.refreshCloudModelHint();
                 controller.applyMode();
+
+                // 重启后 COMBO 的 options 只剩占位项，而工作流里存着上次选的模型名，
+                // 提交时会被 ComfyUI 的 COMBO 校验拦下（表现为「模型不存在」）。
+                // 先把当前值塞进 options 保证能提交，再异步补扫出完整列表。
+                keepCurrentModelChoice(this);
+                void ensureModelChoices(this);
             } catch (error) {
                 console.error("[nl2prompt] 读取 _llm_json 失败，使用默认值", error);
             }
