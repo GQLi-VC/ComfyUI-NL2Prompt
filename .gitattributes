@@ -15,3 +15,8 @@
 *.bin binary
 *.zip binary
 *.7z binary
+
+# ---- 数据文件必须按二进制处理 ----
+# 本文件顶部的 `* text=auto eol=lf` 会作用于所有文件；SQLite 数据库若被做行尾
+# 转换会直接损坏，所以这里显式声明为 binary（不做 diff、不做 eol 转换）。
+*.db binary
