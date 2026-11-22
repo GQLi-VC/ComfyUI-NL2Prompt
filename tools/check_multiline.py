@@ -80,9 +80,10 @@ def main():
     core = nodes._compose_core("高清，全身照，城市街道，夜晚", make_ui(CAST))
     lines = lines_of(core["positive"])
     check("正好 4 行", len(lines) == 4, repr(lines))
-    check("第 1 行是质量标签",
+    # v12：质量词**不查库**（best_quality 在库里 posts=0 是空壳），保持空格写法
+    check("第 1 行是质量标签（空格写法，库名为空壳不用）",
           "best quality" in lines[0] and "masterpiece" in lines[0], lines[0])
-    check("第 2 行是图片视距", "full body" in lines[1], lines[1])
+    check("第 2 行是图片视距（库名形式）", "full_body" in lines[1], lines[1])
     check("第 3 行是角色行（含角色触发词）", "castorice" in lines[2], lines[2])
     check("最后一行是场景", "street" in lines[-1] and "city" in lines[-1], lines[-1])
     check("角色行含着装标签", nodes._has_garment_tag(lines[2]), lines[2])
@@ -112,7 +113,7 @@ def main():
           not any(word in flat3 for word in ("street", "classroom", "park")), flat3[:200])
     check("没有编造角色数量（不出现 2girls）", "2girls" not in flat3, flat3[:200])
     check("角色行里的标签全部来自角色预设",
-          "castorice" in flat3 and "purple hair" in flat3, flat3[:200])
+          "castorice" in flat3 and "purple_hair" in flat3, flat3[:200])
 
     # ---------------- 4. 中文确定性转译 ----------------
     section("4. 中文转译按确定性映射（不是 LLM 猜）")
@@ -122,7 +123,7 @@ def main():
           result["scene"] == ["street", "city"], str(result["scene"]))
     core4 = nodes._compose_core("全身照，城市街道", make_ui(CAST))
     flat4 = core4["positive"]
-    check("组装结果里出现 full body", "full body" in flat4, flat4[:200])
+    check("组装结果里出现 full_body（库名）", "full_body" in flat4, flat4[:200])
     check("组装结果里出现 street, city",
           "street" in flat4 and "city" in flat4, flat4[:200])
     check("debug.cn_mapped 记录了映射结果",
@@ -130,6 +131,8 @@ def main():
 
     section("4b. 质量 / 人数映射")
     quality = nodes._compose_core("高清", make_ui([]))
+    # v12：质量词属于模型侧提示词，不是 danbooru 概念标签 ——
+    # 库里 best_quality posts=0（空壳），所以保持空格写法 best quality
     check("高清 -> best quality, masterpiece, highres",
           all(tag in quality["positive"]
               for tag in ("best quality", "masterpiece", "highres")),

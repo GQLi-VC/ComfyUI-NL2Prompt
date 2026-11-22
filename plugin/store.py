@@ -500,6 +500,8 @@ def _normalize_character(raw) -> "dict | None":
         "lora_name": _text(char.get("lora_name")) or None,
         "lora_strength": _strength(char.get("lora_strength"), 0.8),
         "base_model": _text(char.get("base_model"), "anima"),
+        # v12：性别（female / male），用于推断人数标签；缺字段时为 None
+        "gender": _text(char.get("gender")) or None,
         "activation_words": _tokens(char.get("activation_words")),
         "outfits": outfits,
     }

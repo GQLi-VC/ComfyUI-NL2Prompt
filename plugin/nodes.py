@@ -645,9 +645,29 @@ def _split_lines(text):
 
 
 def _join_lines(rows):
-    """``[[标签...], ...]`` -> 多行文本（``_split_lines`` 的逆操作）。"""
-    lines = [_TAG_SEP.join(tokens) for tokens in (rows or []) if tokens]
-    return "\n".join(lines)
+    """``[[标签...], ...]`` -> 多行文本（``_split_lines`` 的逆操作）。
+
+    **稳定去重（保序，行内 + 跨行）**：上游任何一步产生重复标签
+    （重试拼接、``_restructure_rows`` 从多行各收一个同维标签等）
+    都不会漏到最终 positive。比较用「小写 + 下划线归一空格」，
+    所以 ``cowboy_shot`` 与 ``cowboy shot`` 视为同一个标签。
+    """
+    seen = set()
+    out_rows = []
+    for tokens in (rows or ()):
+        kept = []
+        for tag in tokens:
+            text = str(tag if tag is not None else "").strip()
+            if not text:
+                continue
+            key = text.lower().replace("_", " ")
+            if key in seen:
+                continue
+            seen.add(key)
+            kept.append(text)
+        if kept:
+            out_rows.append(kept)
+    return "\n".join(_TAG_SEP.join(tokens) for tokens in out_rows)
 
 
 def _dedupe_join(parts, sep=", "):
@@ -1652,6 +1672,25 @@ def _compose_core(natural_language, ui, data=None):
         "scene": list(cn_mapped.get("scene") or ()),
     }
 
+    # v12：角色性别表（供人数推断；characters.json 的 gender 字段）
+    gender_map = {}
+    for row in config["character_rows"]:
+        name = _s(row.get("name"))
+        if not name:
+            continue
+        character = view.resolve_character(name)
+        if character:
+            gender_map[name] = _norm(character.get("gender"))
+    debug["gender_map"] = gender_map
+
+    # v12：用户手填的 trigger（库名规范化时要跳过，契约 §5 要求原样保留）
+    user_triggers = []
+    for row in config["character_rows"]:
+        user_triggers.extend(_split_tokens(row.get("trigger")))
+    for row in config["style_rows"]:
+        user_triggers.extend(_split_tokens(row.get("trigger")))
+    debug["user_triggers"] = _dedupe_tokens(user_triggers)
+
     # ---------------- 角色行（契约 §5 第一段）
     for row in config["character_rows"]:
         hint_consumed_by_preset = False
@@ -1856,8 +1895,12 @@ def _compose_core(natural_language, ui, data=None):
     # v11 修 2：第 2 行必须有人数（正面提示词结构）。放在 has_content 之后，
     # 避免「补了 1girl 就不算空内容」破坏 cjk_fallback 的判定。
     if not any(_tag_dimension(tag) == "count" for tag in seg_framing):
-        seg_framing.extend(_infer_character_count(config))
+        _count_tags, _gender_assumed = _infer_character_count(
+            config, debug.get("gender_map"))
+        seg_framing.extend(_count_tags)
         debug["count_inferred"] = True
+        if _gender_assumed:
+            debug["gender_assumed"] = True
 
     # v11：cn_map 的**角色行标签**（发色/瞳色/表情/动作，如「蓝发」-> blue hair、
     # 「在微笑」-> smile）也要进模板 positive，否则 LLM 路径的来源白名单里没有它们，
@@ -1871,6 +1914,17 @@ def _compose_core(natural_language, ui, data=None):
 
     positive = _join_segments(
         seg_quality, seg_framing, seg_characters, seg_scene)
+    # v12：模板输出也要按库名规范（与 LLM 路径同一套规则）。
+    # 触发词保护只覆盖**用户手填的 trigger**（契约 §5「不换拼写」）；
+    # 数据层的 activation_words / outfit.prompt 仍要规范成库名。
+    _name_info = {}
+    positive, _rename_map = _normalize_tag_names(
+        positive, _name_info,
+        skip_keys={_norm_tag_key(tag) for tag in debug.get("user_triggers") or ()})
+    if _name_info.get("renamed"):
+        debug["names_normalized"] = list(_name_info["renamed"])
+    if _name_info.get("name_unknown"):
+        debug["name_unknown"] = list(_name_info["name_unknown"])
     negative = _dedupe_join(negative_parts)
 
     # v10：空输出的兜底（极端情况），**绝不输出空串**
@@ -2780,6 +2834,252 @@ def _template_allowlist(core):
         return allow
 
 
+# ---------------------------------------------------------------------------
+# v12：标签写法以 danbooru 标签库为准
+# ---------------------------------------------------------------------------
+#: 与库名比较时忽略大小写
+_CANONICAL_WEIGHT_RE = re.compile(r"^\s*\((.*):([0-9.]+)\s*\)\s*$")
+
+
+def _split_weight(tag):
+    """``(long hair:1.2)`` -> ``("long hair", ":1.2)")``；无权重时后缀为空。"""
+    text = str(tag if tag is not None else "").strip()
+    match = _CANONICAL_WEIGHT_RE.match(text)
+    if match:
+        return match.group(1).strip(), ":%s)" % match.group(2)
+    return text, ""
+
+
+#: 质量类标签**完全不查库**（lead 核实）：
+#:
+#:   ==================  ==========================  ==========================
+#:   词                    库里的情况                    结论
+#:   ==================  ==========================  ==========================
+#:   ``best_quality``    cat=5(meta) **posts=0**     空壳，当「库里没有」
+#:   ``masterpiece``     不存在                      保持原样
+#:   ``highres``         posts=8033637               本来就是库名，不变
+#:   ``absurdres``       posts=2939616               本来就是库名，不变
+#:   ``high definition`` 不存在                      保持原样
+#:   ==================  ==========================  ==========================
+#:
+#: 这类词是**模型侧的质量提示词**，不是 danbooru 概念标签；``best_quality`` 虽然
+#: 在库里有记录但 posts=0（danbooru 上从未被实际使用），拿去出图毫无意义。
+#: 所以整类走白名单，只做「原样保留」或「用中文映射给的原样」。
+_QUALITY_KEEP_AS_IS = frozenset((
+    "masterpiece", "best quality", "best_quality", "good quality",
+    "normal quality", "worst quality", "low quality", "lowres",
+    "highres", "absurdres", "very aesthetic", "high definition",
+    "highly detailed", "high aesthetic",
+))
+
+#: 只有这两种匹配方式可信：精确命中、或库内明确登记的别名。
+#: ``fts_lowfreq`` / ``prefix_*`` 之类的模糊匹配会把语义完全不同的标签换进来。
+_TRUSTED_LOOKUP_VIA = frozenset(("exact", "alias"))
+
+#: 库名要求的最低使用量。``posts < 100`` 的标签（尤其 posts=0 的空壳）
+#: 等同于「库里没有」，一律保持原样，不拿它去替换用户/映射给的写法。
+_CANONICAL_MIN_POSTS = 100
+
+
+def _lookup_canonical(tag):
+    """查库拿标准名；查不到 / 不可信 / 使用量过低时返回空串（调用方保持原样）。"""
+    if _tagdb_mod is None:
+        return ""
+    lookup = getattr(_tagdb_mod, "lookup", None)
+    if not callable(lookup):
+        return ""
+    try:
+        probe = _norm_tag_key(tag)
+        # 质量类标签整类不查库（原样保留）
+        if probe in _QUALITY_KEEP_AS_IS:
+            return ""
+        result = lookup(tag)
+        if not isinstance(result, dict) or not result.get("hit"):
+            return ""
+        if result.get("via") not in _TRUSTED_LOOKUP_VIA:
+            return ""
+        # posts=0 的空壳标签没有实际使用价值，视同未命中
+        try:
+            posts = int(result.get("post_count") or 0)
+        except Exception:  # noqa: BLE001
+            posts = 0
+        if posts < _CANONICAL_MIN_POSTS:
+            return ""
+        return _s(result.get("name"))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _normalize_tag_names(positive, info=None, skip_keys=None):
+    """把 positive 里每个标签规范成库里的标准名。
+
+    :param positive: 待规范的多行 positive。
+    :param info: 可选的 payload，写 ``renamed`` / ``name_unknown`` / ``skipped``。
+    :param skip_keys: 归一 key 集合，命中的标签**原样保留**。
+        用于保护触发词（契约 §5：角色/服装/风格触发词不增不减不改写）——
+        实测 ``castorice`` 会被规范成 ``castorice_(honkai:_star_rail)``，属改写。
+    :returns: ``(new_positive, rename)``，``rename`` 是
+        ``{归一 key: 库名}``，供调用方把 debug 里的 key 一起改名。
+    """
+    payload = info if isinstance(info, dict) else {}
+    payload.setdefault("renamed", [])
+    payload.setdefault("name_unknown", [])
+    payload.setdefault("skipped", [])
+    protected = {key for key in (skip_keys or ()) if key}
+    rename = {}
+    try:
+        rows = _split_lines(positive)
+        if not rows:
+            return positive, rename
+        new_rows = []
+        for row in rows:
+            new_row = []
+            for tag in row:
+                core, suffix = _split_weight(tag)
+                if not core:
+                    continue
+                # 画师标签（@ 前缀）不是 danbooru 标签，不查库
+                if core.startswith("@"):
+                    new_row.append(tag)
+                    continue
+                # 触发词保护：原样保留，不查库
+                if _norm_tag_key(core) in protected:
+                    payload["skipped"].append(core)
+                    new_row.append(tag)
+                    continue
+                canonical = _lookup_canonical(core)
+                if not canonical:
+                    # 质量类词统一成可读的**空格**形式：库里的 ``best_quality``
+                    # posts=0 是空壳，不能作为输出写法（lead 核实）。
+                    # 它们仍然记进 name_unknown —— 库里确实没有可用的对应条目。
+                    probe_key = _norm_tag_key(core)
+                    if probe_key in _QUALITY_KEEP_AS_IS:
+                        canonical = probe_key
+                        payload["name_unknown"].append(core)
+                    else:
+                        payload["name_unknown"].append(core)
+                        new_row.append(tag)
+                        continue
+                new_tag = canonical + suffix
+                if new_tag != tag:
+                    payload["renamed"].append({"from": tag, "to": new_tag})
+                    rename[_norm_tag_key(core)] = canonical
+                new_row.append(new_tag)
+            if new_row:
+                new_rows.append(new_row)
+        if not new_rows:
+            return positive, rename
+        return _join_lines(new_rows), rename
+    except Exception as exc:  # noqa: BLE001 - 规范化只是写法增强，绝不拖垮出图
+        _log(f"_normalize_tag_names 异常（原样返回）：{type(exc).__name__}: {exc}")
+        return positive, rename
+
+
+def _resync_debug_keys(tag_sources, dropped, cn_enforced, positive):
+    """按**最终 positive 的写法**重建 debug 里的标签 key（v12）。
+
+    ``tag_sources`` 的 key 是 ``_norm_tag_key``（空格形式），而 positive 定稿后
+    可能是库名（``blue_hair``）。若不做这一步，用户排查时会出现
+    「positive 里是 ``blue_hair``、tag_sources 里是 ``blue hair``」对不上的情况。
+    """
+    try:
+        final_form = {}
+        for row in _split_lines(positive):
+            for tag in row:
+                core, _suffix = _split_weight(tag)
+                key = _norm_tag_key(core)
+                if key and key not in final_form:
+                    final_form[key] = core
+        if not final_form:
+            return tag_sources, dropped, cn_enforced
+        new_sources = {}
+        for key, value in (tag_sources or {}).items():
+            new_sources[final_form.get(key, key)] = value
+        new_dropped = []
+        for item in (dropped or []):
+            if not isinstance(item, dict):
+                new_dropped.append(item)
+                continue
+            tag = item.get("tag")
+            new_dropped.append(
+                dict(item, tag=final_form.get(_norm_tag_key(tag), tag)))
+        new_enforced = [final_form.get(_norm_tag_key(tag), tag)
+                        for tag in (cn_enforced or [])]
+        return new_sources, new_dropped, new_enforced
+    except Exception:  # noqa: BLE001
+        return tag_sources, dropped, cn_enforced
+
+
+def _rename_debug_keys(tag_sources, dropped, cn_enforced, rename):
+    """把 debug 里的标签 key 一起改成库名（lead 提醒：必须与 positive 一致）。"""
+    if not rename:
+        return tag_sources, dropped, cn_enforced
+    new_sources = {}
+    for key, value in (tag_sources or {}).items():
+        new_sources[rename.get(key, key)] = value
+    new_dropped = []
+    for item in (dropped or []):
+        if not isinstance(item, dict):
+            new_dropped.append(item)
+            continue
+        tag = item.get("tag")
+        new_dropped.append(dict(item, tag=rename.get(_norm_tag_key(tag), tag)))
+    new_enforced = [rename.get(_norm_tag_key(tag), tag)
+                    for tag in (cn_enforced or [])]
+    return new_sources, new_dropped, new_enforced
+
+
+def _finalize_positive(positive, tagdb_debug, core, natural_language, ui):
+    """positive 定稿前的统一收尾（首轮与重试共用，v12）。
+
+    依次做三件事：
+      1. **来源校验**：删无来源标签、补回确定性映射标签、补人数（``_enforce_tag_sources``）
+      2. **库名规范化**：写法以 tagdb 为准（``_normalize_tag_names``，触发词跳过）
+      3. **debug key 同步**：``tag_sources`` / ``dropped`` / ``cn_enforced`` 的 key
+         与最终 positive 写法完全一致（lead 提醒的坑）
+
+    :returns: ``(positive, tagdb_debug)``
+    """
+    core_debug = core.get("debug") if isinstance(core, dict) else {}
+    core_debug = core_debug if isinstance(core_debug, dict) else {}
+    info = dict(tagdb_debug) if isinstance(tagdb_debug, dict) else {}
+
+    positive, source_info = _enforce_tag_sources(
+        positive, core, natural_language, ui,
+        core_debug.get("cn_segments") or {})
+    info["tag_sources"] = dict(source_info.get("tag_sources") or {})
+    info["dropped"] = list(source_info.get("dropped") or [])
+    info["cn_enforced"] = list(source_info.get("enforced") or [])
+    if source_info.get("gender_assumed"):
+        info["gender_assumed"] = True
+
+    name_info = {}
+    positive, rename_map = _normalize_tag_names(
+        positive, name_info,
+        skip_keys={_norm_tag_key(tag)
+                   for tag in (core_debug.get("user_triggers") or ())})
+
+    (sources, dropped, enforced) = _rename_debug_keys(
+        info.get("tag_sources"), info.get("dropped"),
+        info.get("cn_enforced"), rename_map)
+    info["tag_sources"] = sources
+    info["dropped"] = dropped
+    info["cn_enforced"] = enforced
+
+    (sources, dropped, enforced) = _resync_debug_keys(
+        info.get("tag_sources"), info.get("dropped"),
+        info.get("cn_enforced"), positive)
+    info["tag_sources"] = sources
+    info["dropped"] = dropped
+    info["cn_enforced"] = enforced
+
+    if name_info.get("renamed"):
+        info["names_normalized"] = list(name_info["renamed"])
+    if name_info.get("name_unknown"):
+        info["name_unknown"] = list(name_info["name_unknown"])
+    return positive, info
+
+
 def _restructure_rows(rows):
     """按「正面提示词结构」**强制重排**各段（v11）。
 
@@ -2797,9 +3097,20 @@ def _restructure_rows(rows):
     try:
         quality, framing, scene = [], [], []
         character_rows = []
+        seen = set()
+
+        def _fresh(tag):
+            key = _norm_tag_key(tag)
+            if not key or key in seen:
+                return False
+            seen.add(key)
+            return True
+
         for row in rows or ():
             keep = []
             for tag in row:
+                if not _fresh(tag):
+                    continue
                 dimension = _tag_dimension(tag)
                 if dimension == "quality":
                     quality.append(tag)
@@ -2836,6 +3147,11 @@ def _enforce_tag_sources(positive, core, natural_language, ui, cn_mapped):
         if not rows:
             return positive, info
         allow = _template_allowlist(core)
+        # v12：性别表由模板路径算好放在 core.debug 里，供人数推断使用
+        core_debug = core.get("debug") if isinstance(core, dict) else {}
+        if isinstance(core_debug, dict) and isinstance(
+                core_debug.get("gender_map"), dict):
+            info["gender_map"] = dict(core_debug["gender_map"])
         mentioned = _mentioned_dimensions(natural_language, cn_mapped, ui)
         user_tokens = set(
             re.findall(r"[a-z0-9_']+", str(natural_language or "").lower()))
@@ -2946,26 +3262,54 @@ def _enforce_cn_segments(rows, cn_mapped, info):
     return rows
 
 
-def _infer_character_count(ui):
-    """按 UI 里的角色行数推人数标签（修 2）。
+def _infer_character_count(ui, gender_map=None):
+    """按角色**性别**推人数标签（v12，lead 指定）。
 
-    ``characters.json`` 没有性别字段，所以：
-      * 1 个角色 -> ``1girl``（danbooru 动漫图绝大多数为女性）
-      * 2 个 -> ``2girls``
-      * 3 个及以上 -> ``Ngirls``
-      * 0 个 -> ``1girl``（结构要求第 2 行至少有人数）
-    返回值同时带 ``solo``（单人时）。
+    ``gender`` 来自 ``plugin/data/characters.json``（本轮已给 9 个角色补上）。
+
+    =======================  =========================
+    角色性别组合              人数标签
+    =======================  =========================
+    1 female                 ``1girl, solo``
+    1 male                   ``1boy, solo``
+    2 female                 ``2girls``
+    1 female + 1 male        ``1girl, 1boy``
+    2 male                   ``2boys``
+    缺 gender / 无角色        ``1girl, solo``（保守，标记 assumed）
+    =======================  =========================
+
+    :returns: ``(tags, assumed)`` —— ``assumed=True`` 表示有角色缺 gender 被兜底，
+        调用方应写 ``debug.gender_assumed``。
     """
     try:
         config = _normalize_ui(ui)
-        count = sum(
-            1 for row in config["character_rows"] if _s(row.get("trigger")))
-        count = max(1, count)
-        if count == 1:
-            return ["1girl", "solo"]
-        return ["%dgirls" % count]
+        mapping = gender_map if isinstance(gender_map, dict) else {}
+        assumed = False
+        genders = []
+        for row in config["character_rows"]:
+            if not _s(row.get("trigger")):
+                continue
+            name = _s(row.get("name"))
+            gender = _norm(mapping.get(name)) if name else ""
+            if gender not in ("female", "male"):
+                gender = "female"
+                assumed = True
+            genders.append(gender)
+        if not genders:
+            genders = ["female"]
+            assumed = True
+        girls = genders.count("female")
+        boys = genders.count("male")
+        tags = []
+        if girls:
+            tags.append("1girl" if girls == 1 else "%dgirls" % girls)
+        if boys:
+            tags.append("1boy" if boys == 1 else "%dboys" % boys)
+        if girls == 1 and not boys:
+            tags.append("solo")
+        return tags, assumed
     except Exception:  # noqa: BLE001
-        return ["1girl"]
+        return ["1girl", "solo"], True
 
 
 def _enforce_character_count(rows, ui, cn_mapped, info):
@@ -2974,7 +3318,13 @@ def _enforce_character_count(rows, ui, cn_mapped, info):
         sources = info["tag_sources"]
         explicit = [tag for tag in (cn_mapped.get("framing") or ())
                     if _tag_dimension(tag) == "count"]
-        targets = explicit or _infer_character_count(ui)
+        gender_map = info.get("gender_map") or {}
+        if explicit:
+            targets = explicit
+        else:
+            targets, gender_assumed = _infer_character_count(ui, gender_map)
+            if gender_assumed:
+                info["gender_assumed"] = True
         existing = {_norm_tag_key(tag) for row in rows for tag in row}
         # 已经有任何一个 count 标签就不重复补（solo 与 2girls 互斥，只留一个口径）
         has_count = any(
@@ -3566,20 +3916,10 @@ def _rewrite_only(llm, natural_language, ui, data=None, core=None):
         tagdb_debug = dict(tagdb_debug)
         tagdb_debug["agent"] = tagdb_agent_debug
 
-    # v11 修 1 + 修 3（放在 agent **之后**）：agent 可能回退第 1 轮结果、
-    # 也可能带进新的无来源标签，所以来源校验必须是最终一道门。
-    _core_debug = core.get("debug") if isinstance(core, dict) else {}
-    _core_debug = _core_debug if isinstance(_core_debug, dict) else {}
-    positive, source_info = _enforce_tag_sources(
-        positive, core, natural_language, ui,
-        _core_debug.get("cn_segments") or {})
-    if isinstance(tagdb_debug, dict):
-        tagdb_debug = dict(tagdb_debug)
-    else:
-        tagdb_debug = {}
-    tagdb_debug["tag_sources"] = dict(source_info.get("tag_sources") or {})
-    tagdb_debug["dropped"] = list(source_info.get("dropped") or [])
-    tagdb_debug["cn_enforced"] = list(source_info.get("enforced") or [])
+    # v11 + v12：来源校验（禁止编造）+ 库名规范化 + debug key 同步，
+    # 放在 agent **之后**（agent 可能回退第 1 轮结果、也可能带进新标签）
+    positive, tagdb_debug = _finalize_positive(
+        positive, tagdb_debug, core, natural_language, ui)
 
     # 契约 §14.2（lead 裁决）：**强制并入**模板的 outfit 抑制词，不依赖 LLM 自觉。
     # 必须在 check_anima 之前，让校验看到的就是最终值。
@@ -3674,6 +4014,11 @@ def _rewrite_only(llm, natural_language, ui, data=None, core=None):
             check2,
         )
         negative_missing = negative_missing2
+
+        # 重试结果与首轮对称收尾：来源校验 + 库名规范化 + debug key 同步。
+        # 不补这一步，重试成功后 tag_sources 会被 _apply_tagdb 的返回值覆盖成空。
+        positive, tagdb_debug = _finalize_positive(
+            positive, tagdb_debug, core, natural_language, ui)
 
     skill_check_debug = {
         "ok": bool(check.get("ok", True)),

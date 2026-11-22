@@ -94,17 +94,29 @@ def main():
 
     # ---------------- 4. 人数推断 ----------------
     section("4. _infer_character_count")
-    check("无角色 -> 1girl, solo",
-          nodes._infer_character_count(make_ui()) == ["1girl", "solo"],
-          str(nodes._infer_character_count(make_ui())))
-    check("1 个角色 -> 1girl, solo",
-          nodes._infer_character_count(make_ui(CAST)) == ["1girl", "solo"],
-          str(nodes._infer_character_count(make_ui(CAST))))
+    # v12：返回值是 (tags, assumed)；assumed 表示有角色缺 gender 被保守兜底
+    tags, assumed = nodes._infer_character_count(make_ui())
+    check("无角色 -> 1girl, solo", tags == ["1girl", "solo"], str(tags))
+    check("无角色 -> gender_assumed=True", assumed is True, str(assumed))
+    tags, assumed = nodes._infer_character_count(
+        make_ui(CAST), {"遐蝶": "female"})
+    check("1 个 female -> 1girl, solo", tags == ["1girl", "solo"], str(tags))
+    check("1 个 female -> 不标记假设", assumed is False, str(assumed))
     two = CAST + [{"id": "r2", "name": "流萤",
                    "trigger": "firefly (honkai: star rail)", "outfit_hint": "原皮"}]
-    check("2 个角色 -> 2girls",
-          nodes._infer_character_count(make_ui(two)) == ["2girls"],
-          str(nodes._infer_character_count(make_ui(two))))
+    tags, assumed = nodes._infer_character_count(
+        make_ui(two), {"遐蝶": "female", "流萤": "female"})
+    check("2 个 female -> 2girls", tags == ["2girls"], str(tags))
+    tags, assumed = nodes._infer_character_count(
+        make_ui(CAST), {"遐蝶": "male"})
+    check("1 个 male -> 1boy", tags == ["1boy"], str(tags))
+    tags, assumed = nodes._infer_character_count(
+        make_ui(two), {"遐蝶": "female", "流萤": "male"})
+    check("1 female + 1 male -> 1girl, 1boy",
+          tags == ["1girl", "1boy"], str(tags))
+    tags, assumed = nodes._infer_character_count(make_ui(CAST), {})
+    check("缺 gender -> 保守 1girl 且标记 assumed",
+          tags == ["1girl", "solo"] and assumed is True, str((tags, assumed)))
 
     # ---------------- 5. 模板路径：人数进第 2 行 ----------------
     section("5. 模板路径：角色数量强制进第 2 行")
@@ -112,8 +124,8 @@ def main():
     lines = core["positive"].split("\n")
     check("第 2 行含 1girl", "1girl" in lines[1], repr(lines))
     check("debug.count_inferred=True", core["debug"].get("count_inferred") is True)
-    check("中文映射的 blue hair 进了角色行",
-          any("blue hair" in line for line in lines), repr(lines))
+    check("中文映射的 blue_hair 进了角色行（库名形式）",
+          any("blue_hair" in line for line in lines), repr(lines))
 
     # ---------------- 6. 端到端：编造被删 ----------------
     section("6. 端到端：LLM 编造被来源校验删除")
@@ -187,8 +199,8 @@ def main():
             "一个蓝发少女", ui, core=core)
         positive = str(result.get("positive") or "")
         lowered = positive.lower()
-        for tag in ("castorice", "purple hair", "purple eyes", "twintails",
-                    "pointy ears", "earrings"):
+        for tag in ("castorice", "purple_hair", "purple_eyes", "twintails",
+                    "pointy_ears", "earrings"):
             check("角色库特征 %r 保留" % tag, tag in lowered, positive[:200])
     finally:
         nodes._call_llm_once = original
@@ -211,6 +223,44 @@ def main():
               "neon" in positive.lower(), positive)
     finally:
         nodes._call_llm_once = original
+
+
+    # ---------------- 9. 幂等 / 去重（lead 发现的 bug） ----------------
+    section("9. _finalize_positive 幂等 + 无重复标签")
+    ui9 = make_ui(CAST)
+    core9 = nodes._compose_core("两个女角色在公园散步，中景，高清", ui9)
+    raw9 = core9["positive"]
+
+    first, info1 = nodes._finalize_positive(raw9, {}, core9, "两个女角色在公园散步", ui9)
+    second, info2 = nodes._finalize_positive(first, {}, core9, "两个女角色在公园散步", ui9)
+    check("同一份 positive 调两次结果一致（幂等）", first == second,
+          "%r vs %r" % (first, second))
+
+    for label, text in (("模板输出", raw9), ("finalize 一次", first),
+                        ("finalize 两次", second)):
+        tags = [t.strip() for line in text.split("\n")
+                for t in line.split(",") if t.strip()]
+        lowered = [t.lower().replace("_", " ") for t in tags]
+        duplicates = sorted({t for t in lowered if lowered.count(t) > 1})
+        check("%s：没有重复标签" % label, not duplicates, str(duplicates))
+
+    # 行内也不能有重复（用例 3 的具体症状）
+    for label, text in (("finalize 一次", first), ("finalize 两次", second)):
+        bad_lines = []
+        for line in text.split("\n"):
+            items = [t.strip().lower().replace("_", " ")
+                     for t in line.split(",") if t.strip()]
+            if len(items) != len(set(items)):
+                bad_lines.append(line)
+        check("%s：没有行内重复标签" % label, not bad_lines, str(bad_lines))
+
+    # 来源表条数应与最终标签数一致（lead 用 38 vs 37 定位的）
+    tags_final = [t.strip() for line in first.split("\n")
+                  for t in line.split(",") if t.strip()]
+    sources_final = info1.get("tag_sources") or {}
+    check("标签数与 tag_sources 条数一致",
+          len(tags_final) == len(sources_final),
+          "%d vs %d" % (len(tags_final), len(sources_final)))
 
     print()
     print("=" * 68)

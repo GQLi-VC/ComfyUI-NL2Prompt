@@ -1,5 +1,5 @@
 {
   "schema": 1,
-  "_note": "角色数据（本文件的示例已清空，按下面格式自行填写）。lora_name 填你 models/loras/ 下真实存在的文件名；activation_words 用英文 danbooru 风格标签，prompt 必须是英文 danbooru 风格标签（会被直接拼进 positive，写中文会让提示词失效）；第一套服装的 id 固定为 default，其余服装用任意 id。(Illustrious)/(SDXL)/pony 底模的 LoRA 不兼容 Anima，不要收进来。",
+  "_note": "示例数据（空）。characters 里每个角色支持字段：id / display_name / aliases / activation_words / **gender（female|male，用于推导 1girl/1boy/2girls 等人数标签，缺省按 1girl 处理）** / base_model / lora_name / lora_strength / outfits。activation_words 与 outfits[].activation_words 里的词会被直接拼进 positive，必须是英文 danbooru 风格标签（写中文会让提示词失效）；多词标签会用下划线形式（如 purple_hair）。",
   "characters": []
 }
