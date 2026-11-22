@@ -1,6 +1,4 @@
 # -*- coding: utf-8 -*-
-# SPDX-License-Identifier: AGPL-3.0-only
-# -*- coding: utf-8 -*-
 """自然语言提示词插件 —— 数据层（store）。
 
 对外接口见 ``docs/接口契约.md`` §10：

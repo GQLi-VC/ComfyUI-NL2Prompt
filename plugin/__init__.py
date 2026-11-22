@@ -1,5 +1,3 @@
-# SPDX-License-Identifier: AGPL-3.0-only
-# Copyright (C) 2026 GQLI-VC
 """ComfyUI 自然语言提示词（插件入口）。
 
 契约：``docs/接口契约.md``

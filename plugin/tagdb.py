@@ -907,13 +907,37 @@ def normalize_token(token, whitelist=(), min_conf=DEFAULT_MIN_CONFIDENCE):
 
 
 def split_tags(text):
-    """按英文逗号切标签（保留顺序、丢弃空项）。"""
+    """按英文逗号**或换行**切标签（保留顺序、丢弃空项）。
+
+    v10：positive 可以是多行分段结构（每行一个语义段），所以换行也是分隔符。
+    单行输入的行为与旧版完全一致。
+    """
     try:
         if not isinstance(text, str):
             return []
-        return [piece.strip() for piece in text.split(",") if piece.strip()]
+        flat = text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", ",")
+        return [piece.strip() for piece in flat.split(",") if piece.strip()]
     except Exception:
         return []
+
+
+def split_tag_lines(text):
+    """按行切分、每行再按逗号切；返回 ``[[tag, ...], ...]``（保留行结构）。
+
+    v10 新增：``normalize_text`` 用它**保持原来的分段结构**，不拍平成一个长串。
+    """
+    rows = []
+    try:
+        if not isinstance(text, str):
+            return rows
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        for line in normalized.split("\n"):
+            tags = [piece.strip() for piece in line.split(",") if piece.strip()]
+            if tags:
+                rows.append(tags)
+        return rows
+    except Exception:
+        return rows
 
 
 def normalize_text(text, whitelist=(), min_conf=DEFAULT_MIN_CONFIDENCE):
@@ -943,10 +967,13 @@ def normalize_text(text, whitelist=(), min_conf=DEFAULT_MIN_CONFIDENCE):
             summary["reason"] = "db_unavailable"
             return summary
 
-        tokens = split_tags(text)
-        if not tokens:
+        rows = split_tag_lines(text)
+        if not rows:
             summary["reason"] = "no_tokens"
             return summary
+        tokens = [token for row in rows for token in row]
+        # v10：多行输入要**保持分段结构**，否则用户看不到「质量/视距/角色/场景」的分层
+        multi_line = len(rows) > 1 or ("\n" in text)
 
         whitelist_keys = _whitelist_keys(whitelist)
         outputs = []
@@ -985,7 +1012,17 @@ def normalize_text(text, whitelist=(), min_conf=DEFAULT_MIN_CONFIDENCE):
                 else:
                     stats["kept"] += 1
 
-        summary["text"] = ", ".join(outputs)
+        if multi_line:
+            # 按原行分组重新拼回，**行结构一字不改**
+            rebuilt = []
+            cursor = 0
+            for row in rows:
+                size = len(row)
+                rebuilt.append(", ".join(outputs[cursor:cursor + size]))
+                cursor += size
+            summary["text"] = "\n".join(rebuilt)
+        else:
+            summary["text"] = ", ".join(outputs)
         summary["skipped"] = False
         if stats["total"]:
             summary["unknown_ratio"] = round(stats["unknown"] / float(stats["total"]), 4)

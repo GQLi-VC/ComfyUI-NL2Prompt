@@ -1,5 +1,3 @@
-# SPDX-License-Identifier: AGPL-3.0-only
-# Copyright (C) 2026 GQLI-VC
 """本地 llama-server 生命周期管理（llm-runtime 负责）。
 
 契约参考：docs/接口契约.md §2.2 / §6 / §8 / §11。
@@ -61,7 +59,7 @@ except ImportError:  # 裸导入（``sys.path.insert(0, plugin_dir); import runt
 # 常量
 # ---------------------------------------------------------------------------
 
-_DEFAULT_LLAMA_SERVER = ""  # 开源版留空：优先读 settings.json，未配置时由调用方提示
+_DEFAULT_LLAMA_SERVER = r"H:\AI\Local\llama.cpp\llama-server.exe"
 _DEFAULT_CTX = 8192
 _DEFAULT_TIMEOUT = 120.0
 _PORT_START = 8081

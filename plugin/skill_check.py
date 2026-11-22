@@ -1,5 +1,3 @@
-# SPDX-License-Identifier: AGPL-3.0-only
-# Copyright (C) 2026 GQLI-VC
 """NL2Prompt 插件 - 提示词校验器（契约 14.2）。
 
 对外函数
@@ -193,7 +191,12 @@ def _norm(value) -> str:
 
 
 def _split_tags(text: str) -> "list[str]":
-    """按顶层逗号切分标签（括号内的逗号不切）。"""
+    """按顶层逗号切分标签（括号内的逗号不切）。
+
+    v10：positive 支持**多行分段结构**（质量 / 视距 / 角色 / 场景各一行），
+    所以**换行也是分隔符**。否则 ``"\\ncastorice"`` 会被当成一个非法标签，
+    导致 skill 校验误报。单行输入的行为与旧版完全一致。
+    """
     tags = []
     try:
         buf = []
@@ -203,7 +206,7 @@ def _split_tags(text: str) -> "list[str]":
                 depth += 1
             elif char == ")":
                 depth = max(0, depth - 1)
-            if char == "," and depth == 0:
+            if (char == "," or char == "\n" or char == "\r") and depth == 0:
                 item = "".join(buf).strip()
                 if item:
                     tags.append(item)
@@ -214,7 +217,8 @@ def _split_tags(text: str) -> "list[str]":
         if tail:
             tags.append(tail)
     except Exception:
-        return [item.strip() for item in text.split(",") if item.strip()]
+        flat = text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", ",")
+        return [item.strip() for item in flat.split(",") if item.strip()]
     return tags
 
 

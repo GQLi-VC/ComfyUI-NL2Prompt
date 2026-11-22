@@ -1,5 +1,3 @@
-# SPDX-License-Identifier: AGPL-3.0-only
-# Copyright (C) 2026 GQLI-VC
 """自然语言提示词 —— 三个 ComfyUI 节点（backend-core）。
 
 契约：``docs/接口契约.md``（唯一真源）
@@ -193,6 +191,54 @@ _providers_mod = _load_sibling("providers")
 # v5：danbooru 标签库访问层。模块导入时不打开数据库（惰性），
 # 缺失/损坏时 _load_sibling 返回 None，全链路自动跳过校验。
 _tagdb_mod = _load_sibling("tagdb")
+# v10：中文 -> 英文的**确定性映射**（不经过 LLM）。缺失时全部降级为空映射，
+# 行为退回 v9（中文仍由 strip_cjk_segments 清掉）。
+_cn_tags_mod = _load_sibling("cn_tags")
+
+
+def _seg_constants():
+    """取段名常量；``cn_tags`` 缺失时用本地兜底。"""
+    return {
+        "quality": getattr(_cn_tags_mod, "SEGMENT_QUALITY", _SEG_QUALITY),
+        "framing": getattr(_cn_tags_mod, "SEGMENT_FRAMING", _SEG_FRAMING),
+        "character": getattr(_cn_tags_mod, "SEGMENT_CHARACTER", _SEG_CHARACTER),
+        "scene": getattr(_cn_tags_mod, "SEGMENT_SCENE", _SEG_SCENE),
+    }
+
+
+def _translate_cn(text):
+    """调用 ``cn_tags.translate``，任何异常都退化成「什么都没翻译」。"""
+    empty = {
+        _SEG_QUALITY: [],
+        _SEG_FRAMING: [],
+        _SEG_CHARACTER: [],
+        _SEG_SCENE: [],
+        "matched": [],
+        "dropped": [],
+        "remaining": text if isinstance(text, str) else "",
+    }
+    if _cn_tags_mod is None:
+        return empty
+    translator = getattr(_cn_tags_mod, "translate", None)
+    if not callable(translator):
+        return empty
+    try:
+        result = translator(text)
+        if not isinstance(result, dict):
+            return empty
+        consts = _seg_constants()
+        for key, alias in (("quality", "quality"), ("framing", "framing"),
+                           ("character", "character"), ("scene", "scene")):
+            value = result.get(consts[alias])
+            if isinstance(value, list) and value:
+                empty[key] = value
+        empty["matched"] = list(result.get("matched") or [])
+        empty["dropped"] = list(result.get("dropped") or [])
+        if isinstance(result.get("remaining"), str):
+            empty["remaining"] = result["remaining"]
+        return empty
+    except Exception:  # noqa: BLE001 - 中文映射只是增强，绝不拖垮组装
+        return empty
 
 
 #: 统一异常类型：优先用 ``llm_client.LLMError``，缺失时用本地等价实现
@@ -522,6 +568,86 @@ def _split_tokens(value):
         if token:
             tokens.append(token)
     return tokens
+
+
+# ---------------------------------------------------------------------------
+# v10：positive 多行分段结构（用户明确要求，参考「正面提示词结构」）
+# ---------------------------------------------------------------------------
+#: 段名常量（与 ``plugin/cn_tags.py`` 的 ``SEGMENT_*`` 保持一致）
+_SEG_QUALITY = "quality"
+_SEG_FRAMING = "framing"
+_SEG_CHARACTER = "character"
+_SEG_SCENE = "scene"
+
+#: 行内分隔符（逗号 + 空格）；**行尾不带逗号** —— 见 skill「输出格式」一节
+_TAG_SEP = ", "
+
+
+def _join_segments(quality, framing, characters, scene):
+    """把各段标签拼成**多行** positive。
+
+    行结构（``正面提示词结构``）：
+
+    ==========  ==========================================
+    行序         内容
+    ==========  ==========================================
+    第 1 行      质量标签
+    第 2 行      图片视距 + 角色数量 + 多角色的大致动作
+    第 3 行起    每个角色一行（角色、动作、着装与表情）
+    最后一行     场景 / 背景 / 画风
+    ==========  ==========================================
+
+    - 段内与跨段都做大小写不敏感去重（保留首次出现顺序）
+    - **空段整行省略**，不产生空行
+    - 行内用 ``", "`` 分隔，行尾不带逗号（ComfyUI 的 CLIPTextEncode 里
+      换行等价于空格，行尾逗号纯属冗余）
+    """
+    seen = set()
+    lines = []
+
+    def _take(parts):
+        out = []
+        for part in parts or ():
+            token = (part or "").strip() if isinstance(part, str) else _s(part)
+            if not token:
+                continue
+            key = token.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(token)
+        return out
+
+    buckets = [_take(quality), _take(framing)]
+    for row in characters or ():
+        buckets.append(_take(row))
+    buckets.append(_take(scene))
+
+    for bucket in buckets:
+        if bucket:
+            lines.append(_TAG_SEP.join(bucket))
+    return "\n".join(lines)
+
+
+def _split_lines(text):
+    """把多行 positive 拆成 ``[[标签, ...], ...]``（按行分组，行内按逗号切）。
+
+    与 ``_join_segments`` 互逆（忽略空行与空标签）。
+    """
+    rows = []
+    if not isinstance(text, str) or not text.strip():
+        return rows
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        tokens = _split_tokens(line)
+        if tokens:
+            rows.append(tokens)
+    return rows
+
+
+def _join_lines(rows):
+    """``[[标签...], ...]`` -> 多行文本（``_split_lines`` 的逆操作）。"""
+    lines = [_TAG_SEP.join(tokens) for tokens in (rows or []) if tokens]
+    return "\n".join(lines)
 
 
 def _dedupe_join(parts, sep=", "):
@@ -1462,11 +1588,29 @@ def _compose_core(natural_language, ui, data=None):
         positive_base_source = "store" if positive_base else ""
     positive_base = (positive_base or "").strip()
 
-    positive_parts = []
-    # v3 B1：正面基础词必须插在**最前面**（角色/风格/自然语言之前）
+    # v10：多行分段。不再用一个扁平列表，而是按「正面提示词结构」分组：
+    #   seg_quality      第 1 行：质量标签
+    #   seg_framing      第 2 行：视距 + 角色数量 + 多角色动作
+    #   seg_characters   第 3 行起：每个角色一行
+    #   seg_scene        最后一行：场景 / 背景 / 画风
+    seg_quality = []
+    seg_framing = []
+    seg_characters = []
+    seg_scene = []
+
+    # v3 B1：正面基础词是**质量标签**，落在第 1 行最前面
     if positive_base:
-        positive_parts.append(positive_base)
+        seg_quality.extend(_split_tokens(positive_base))
     negative_parts = [negative_base]
+
+    # v10：中文确定性映射（用户明确要求「按确定性映射，不是靠 LLM 猜」）。
+    # 「全身照，城市街道」-> framing: full body / scene: street, city
+    # 「高清」-> quality: best quality, masterpiece, highres
+    # 「安全」-> **按 CSV 要求不写进 positive**（记进 debug.cn_dropped）
+    cn_mapped = _translate_cn(language)
+    seg_quality.extend(cn_mapped["quality"])
+    seg_framing.extend(cn_mapped["framing"])
+    seg_scene.extend(cn_mapped["scene"])
     lora_stack = []
 
     debug = {
@@ -1495,9 +1639,24 @@ def _compose_core(natural_language, ui, data=None):
     _raw_seed, actual_seed = _seed_from_ui(config)
     debug["seed"] = actual_seed
 
+    # v10：中文确定性映射的追溯信息（哪些短语被翻译、哪些按需求丢弃）
+    if cn_mapped["matched"]:
+        debug["cn_mapped"] = list(cn_mapped["matched"])
+    if cn_mapped["dropped"]:
+        debug["cn_dropped"] = list(cn_mapped["dropped"])
+    # v11：分段结构要透出给 LLM 路径的来源校验用（扁平 cn_mapped 不够）
+    debug["cn_segments"] = {
+        "quality": list(cn_mapped.get("quality") or ()),
+        "framing": list(cn_mapped.get("framing") or ()),
+        "character": list(cn_mapped.get("character") or ()),
+        "scene": list(cn_mapped.get("scene") or ()),
+    }
+
     # ---------------- 角色行（契约 §5 第一段）
     for row in config["character_rows"]:
         hint_consumed_by_preset = False
+        # v10：每个角色单独一行（多角色时各占一行，见「正面提示词结构」）
+        char_parts = []
         trigger = _s(row.get("trigger"))
         if not trigger:
             if _s(row.get("name")) or _s(row.get("outfit_hint")):
@@ -1510,7 +1669,7 @@ def _compose_core(natural_language, ui, data=None):
                 )
             continue
 
-        positive_parts.extend(_split_tokens(trigger))
+        char_parts.extend(_split_tokens(trigger))
 
         name = _s(row.get("name"))
         hint = _s(row.get("outfit_hint"))
@@ -1536,7 +1695,7 @@ def _compose_core(natural_language, ui, data=None):
                 )
 
             activation = _split_tokens(_first(character, _WORD_KEYS))
-            positive_parts.extend(activation)
+            char_parts.extend(activation)
             debug["injected_triggers"].extend(activation)
 
             if outfit:
@@ -1554,7 +1713,7 @@ def _compose_core(natural_language, ui, data=None):
                 override = detect_outfit_override(natural_language, outfit)
                 if override["override"]:
                     body_tags, clothing_tags = split_body_and_clothing(character, outfit)
-                    positive_parts.extend(body_tags)
+                    char_parts.extend(body_tags)
                     debug["injected_triggers"].extend(body_tags)
                     for word in clothing_tags:
                         negative_parts.append(word)
@@ -1562,7 +1721,7 @@ def _compose_core(natural_language, ui, data=None):
                     # P0：删掉旧服装后**必须补上新服装**，否则角色会"光着"。
                     # 模板路径没法靠 LLM 翻译中文，代码侧直接从用户描述提取。
                     new_garments = extract_garment_tags(natural_language)
-                    positive_parts.extend(new_garments)
+                    char_parts.extend(new_garments)
                     debug["outfit_override"] = {
                         "detected": True,
                         "reason": override["reason"],
@@ -1574,8 +1733,8 @@ def _compose_core(natural_language, ui, data=None):
                         "new_garments": new_garments,
                     }
                 else:
-                    positive_parts.extend(outfit_activation)
-                    positive_parts.extend(_split_tokens(_first(outfit, _PROMPT_KEYS)))
+                    char_parts.extend(outfit_activation)
+                    char_parts.extend(_split_tokens(_first(outfit, _PROMPT_KEYS)))
                     debug["injected_triggers"].extend(outfit_activation)
 
                 outfit_lora = _s(_first(outfit, _LORA_KEYS))
@@ -1617,12 +1776,15 @@ def _compose_core(natural_language, ui, data=None):
         # 命中预设服装时由预设接管（上面已注入该服装的 activation_words / prompt），
         # 这里不再重复注入，避免预设名（中文）混进提示词。
         if hint and not hint_consumed_by_preset:
-            positive_parts.extend(_split_tokens(hint))
+            char_parts.extend(_split_tokens(hint))
+
+        if char_parts:
+            seg_characters.append(char_parts)
 
     # ---------------- 风格行（契约 §5 第二段，无 trigger 也继续）
     for row in config["style_rows"]:
         trigger = _s(row.get("trigger"))
-        positive_parts.extend(_split_tokens(trigger))
+        seg_scene.extend(_split_tokens(trigger))
 
         name = _s(row.get("name"))
         style = view.resolve_style(name) if name else None
@@ -1632,9 +1794,9 @@ def _compose_core(natural_language, ui, data=None):
                 debug["styles"].append(display_name)
 
             style_activation = _split_tokens(_first(style, _WORD_KEYS))
-            positive_parts.extend(style_activation)
-            positive_parts.extend(_split_tokens(_first(style, _PROMPT_KEYS)))
-            positive_parts.extend(_split_tokens(_first(style, _ARTIST_KEYS)))
+            seg_scene.extend(style_activation)
+            seg_scene.extend(_split_tokens(_first(style, _PROMPT_KEYS)))
+            seg_scene.extend(_split_tokens(_first(style, _ARTIST_KEYS)))
             debug["injected_triggers"].extend(style_activation)
 
             style_lora = _s(_first(style, _LORA_KEYS))
@@ -1656,33 +1818,69 @@ def _compose_core(natural_language, ui, data=None):
         if target == "negative":
             negative_parts.append(prompt)
         else:
-            positive_parts.append(prompt)
+            # v10：text_map 是用户手填的映射，可能含中文；原行为是统一清掉，
+            # 现在 positive 不再整体清理，所以这里单独清，保持行为一致。
+            prompt_clean = strip_cjk_segments(prompt)
+            if prompt_clean != prompt:
+                debug["cjk_cleaned"] = True
+            if prompt_clean.strip():
+                seg_scene.append(prompt_clean.strip())
         debug["text_map_hits"].append({"find": find, "target": target, "prompt": prompt})
 
-    # ---------------- 原始自然语言置于末尾（契约 §5）
-    if language.strip():
-        positive_parts.append(language.strip())
+    # ---------------- 原始自然语言：先过确定性映射，剩下的英文进场景行
+    # （v9 的做法是整段塞进 positive 再靠 strip_cjk_segments 删中文；
+    #  v10 改成先映射、再只保留剩余英文，避免中文进到分段结构里）
+    leftover = cn_mapped.get("remaining") or ""
+    leftover_raw = leftover
+    leftover_clean = strip_cjk_segments(leftover).strip() if leftover.strip() else ""
+    leftover_all_cjk = False
+    if leftover_clean != leftover_raw.strip() and leftover_raw.strip():
+        debug["cjk_cleaned"] = True
+        debug["cjk_removed_chars"] = len(leftover_raw) - len(leftover_clean)
+        if not leftover_clean:
+            # 剩下的全是中文：没有可用于正向提示词的英文内容
+            leftover_all_cjk = True
+    if leftover_clean:
+        seg_scene.extend(_split_tokens(leftover_clean))
 
-    positive = _dedupe_join(positive_parts)
+    # v10：质量标签是模型的**必需渲染参数**，不是"编造用户没描述的内容"。
+    # 用户明确说了质量词（高清等）就用用户的；没说就补默认三件套。
+    has_content = bool(seg_framing or seg_scene or any(seg_characters))
+    if not seg_quality:
+        seg_quality = ["best quality", "masterpiece", "highres"]
+        debug["quality_default"] = True
+    if leftover_all_cjk and not has_content:
+        # 全中文又没有角色/风格/场景：只剩默认质量词，标记回退供前端提示
+        debug["cjk_fallback"] = True
+
+    # v11 修 2：第 2 行必须有人数（正面提示词结构）。放在 has_content 之后，
+    # 避免「补了 1girl 就不算空内容」破坏 cjk_fallback 的判定。
+    if not any(_tag_dimension(tag) == "count" for tag in seg_framing):
+        seg_framing.extend(_infer_character_count(config))
+        debug["count_inferred"] = True
+
+    # v11：cn_map 的**角色行标签**（发色/瞳色/表情/动作，如「蓝发」-> blue hair、
+    # 「在微笑」-> smile）也要进模板 positive，否则 LLM 路径的来源白名单里没有它们，
+    # 会被误判为「无来源」删掉。没有角色行时单独成一行（用户描述的角色特征）。
+    cn_character = list(cn_mapped.get("character") or ())
+    if cn_character:
+        if seg_characters:
+            seg_characters[0].extend(cn_character)
+        else:
+            seg_characters.append(cn_character)
+
+    positive = _join_segments(
+        seg_quality, seg_framing, seg_characters, seg_scene)
     negative = _dedupe_join(negative_parts)
 
-    # v9：模板路径 CJK 清理（lead 决策 B）。
-    # CLIP 不懂中文 —— positive 里的中文是纯噪声 token，还会让用户以为插件坏了。
-    # 只删中文片段、保留英文（用户可能写 "换成 black dress"）。
-    # LLM 路径不受影响：它的英文由 skill_check 保证；用户的**中文原始需求**仍通过
-    # `natural_language` 单独传给 messages，不依赖这里的 positive。
-    positive_raw = positive
-    positive_cleaned = strip_cjk_segments(positive)
-    if positive_cleaned != positive_raw:
-        debug["cjk_cleaned"] = True
-        if not positive_cleaned:
-            # 全中文且没有任何结构化标签（没选角色/风格）时，
-            # 回退到基础词，**绝不输出空串**。
-            positive_cleaned = (positive_base or "").strip() or "1girl"
-            debug["cjk_fallback"] = True
-        else:
-            debug["cjk_removed_chars"] = len(positive_raw) - len(positive_cleaned)
-        positive = positive_cleaned
+    # v10：空输出的兜底（极端情况），**绝不输出空串**
+    if not positive.strip():
+        fallback = (positive_base or "").strip() or "1girl"
+        positive = fallback
+        debug["cjk_fallback"] = True
+
+    # 分段结构自检信息（便于前端与日志核对）
+    debug["segment_lines"] = len(positive.splitlines())
 
     # 注入词去重（保留顺序）
     debug["injected_triggers"] = [
@@ -2403,6 +2601,407 @@ def _agent_compare(plan, tagdb_after):
         return summary
 
 
+# ---------------------------------------------------------------------------
+# v11：标签来源校验（禁止编造）+ 确定性标签强制注入 + 角色数量补齐
+# ---------------------------------------------------------------------------
+#: 受控维度：用户**没提到**该维度时，positive 里不允许出现该维度的标签。
+#:
+#: ``user_terms`` 用于判断「用户是否提到这个维度」（中英双语，子串匹配）；
+#: ``tag_words`` 用于把候选标签归到该维度（子串匹配，大小写/下划线不敏感）。
+#: 顺序重要：先匹配更具体的维度（gaze 先于 action，expression 先于 action），
+#: 避免 ``looking back`` 被 action 抢走。
+_CONTROLLED_DIMENSIONS = (
+    ("quality", (
+        "best quality", "masterpiece", "highres", "high definition",
+        "very aesthetic", "absurdres", "highly detailed",
+    ), ""),
+    ("count", (
+        "1girl", "1boy", "2girls", "2boys", "3girls", "3boys",
+        "multiple girls", "multiple boys", "solo",
+    ), ""),
+    ("shot", (
+        "full body", "upper body", "cowboy shot", "close-up", "close up",
+        "wide shot", "extreme close-up", "portrait", "from above",
+        "from below", "from side", "from behind", "from front", "profile",
+        "dutch angle", "aerial", "low angle", "high angle",
+    ), "全身|半身|上半身|特写|远景|广角|中景|大头|全图|机位|俯视|仰视"),
+    ("gaze", (
+        "looking at viewer", "looking back", "looking away", "looking down",
+        "looking up", "eye contact",
+    ), "看镜头|看着镜头|望向镜头|回头|看镜头|视线"),
+    ("expression", (
+        "smile", "grin", "blush", "angry", "crying", "tears", "surprised",
+        "closed eyes", "open mouth", "expressionless", "smug", "pout",
+        "sad", "happy", "embarrassed",
+    ), "微笑|笑|害羞|脸红|生气|哭|流泪|惊讶|闭眼|张嘴|表情|沮丧|开心"),
+    ("action", (
+        "standing", "sitting", "walking", "running", "lying", "squatting",
+        "kneeling", "jumping", "waving", "arm up", "crossed arms",
+        "hands on hips", "leaning", "dancing", "holding", "hugging",
+    ), "站|坐|走|跑|躺|蹲|跪|跳|挥手|举手|回头|抱|叉腰|跳舞|姿势|动作"),
+    ("lighting", (
+        "lighting", "backlighting", "sidelighting", "soft lighting",
+        "dim lighting", "golden hour", "sunlight", "moonlight", "spotlight",
+        "chiaroscuro", "lens flare", "bokeh", "depth of field",
+        "underlighting", "camera flash", "rim light", "volumetric lighting",
+    ), "光|照明|灯光|逆光|柔光|光照|氛围光|打光"),
+    ("scene", (
+        "street", "city", "road", "sidewalk", "pavement", "building",
+        "skyline", "neon", "alley", "park", "classroom", "school", "beach",
+        "ocean", "sea", "forest", "tree", "flower", "field", "garden",
+        "room", "bedroom", "indoors", "outdoors", "shrine", "ruins",
+        "starry sky", "cloud", "sunset", "sunrise", "night", "day", "rain",
+        "snow", "fog", "puddle", "wet", "reflection", "window", "wall",
+        "floor", "sky", "water", "pool", "cafe", "library", "temple",
+        "background", "scenery", "landscape", "factory",
+    ), "街道|城市|校园|学校|教室|海边|海滩|沙滩|森林|树林|公园|房子|建筑|"
+       "室内|户外|室外|卧室|咖啡|图书馆|神社|寺庙|废墟|花田|花海|星空|天空|"
+       "夕阳|日落|日出|黄昏|夜|雨|雪|雾|水边|泳池|工厂|街|背景|风景"),
+    ("hair", (
+        "hair", "twintails", "ponytail", "ahoge", "braid", "bangs",
+        "bob cut", "crew cut", "side ponytail",
+    ), "发|头发|刘海|辫|马尾|呆毛"),
+    ("eyes", (
+        "eyes", "heterochromia", "eyelashes", "eyebrows",
+    ), "眼|瞳|眉|睫毛"),
+    ("outfit", (
+        "dress", "skirt", "shirt", "blouse", "coat", "jacket", "suit",
+        "uniform", "swimsuit", "bikini", "kimono", "armor", "boots",
+        "shoes", "gloves", "thighhighs", "socks", "stockings", "hat",
+        "ribbon", "necktie", "scarf", "cape", "hood", "vest", "pants",
+        "shorts", "clothes", "outfit", "costume", "jewelry", "earrings",
+        "necklace", "hairband", "hairpin", "crown", "footwear", "headwear",
+        "collar", "sleeves", "apron", "leotard",
+    ), "穿|装|衣|裙|裤|鞋|袜|帽|手套|西装|礼服|泳装|制服|和服|盔甲|战袍|"
+       "旗袍|汉服|睡衣|外套|大衣|配饰|首饰|耳环|发饰|冠"),
+)
+
+
+def _norm_tag_key(tag):
+    """标签的**比较 key**：小写、下划线->空格、剥权重、折叠空白。
+
+    ``blue_hair`` 与 ``blue hair`` 视为同一个 key；``(smile:1.2)`` 与 ``smile``
+    也视为同一个 —— 归一化只用于比较，不改变最终输出文本。
+    """
+    try:
+        text = str(tag if tag is not None else "").strip().lower()
+        if not text:
+            return ""
+        match = re.match(r"^\((.*):[0-9.]+\s*\)$", text)
+        if match:
+            text = match.group(1)
+        text = text.replace("_", " ").replace("\\", "")
+        return " ".join(text.split())
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _tag_dimension(tag):
+    """把标签归到受控维度；归不进去返回 ``""``（视为自由标签）。
+
+    特判（v11）：含**独立 hair 词元**的标签先归 ``hair`` ——
+    否则 ``hair flower`` 会被 scene 词表里的 ``flower`` 抢走，
+    ``hair bow`` 会被 outfit 的 ``bow`` 抢走。``black hairband`` 这种
+    ``hair`` 只是一个词根的，不触发特判，仍走 normal 匹配。
+    """
+    key = _norm_tag_key(tag)
+    if not key:
+        return ""
+    padded = " " + key + " "
+    if key == "hair" or key.startswith("hair ") or key.endswith(" hair") \
+            or " hair " in padded:
+        return "hair"
+    for name, tag_words, _user_terms in _CONTROLLED_DIMENSIONS:
+        for word in tag_words:
+            if key == word or key.endswith(" " + word) or (" " + word + " ") in (" " + key + " "):
+                return name
+    return ""
+
+
+def _mentioned_dimensions(natural_language, cn_mapped, ui):
+    """用户**提到过**哪些受控维度（返回 set）。
+
+    三条来源任一命中即算提到：
+      1. 用户原文里的中文/英文关键词（``_CONTROLLED_DIMENSIONS`` 的 user_terms）
+      2. 中文确定性映射产出了该维度的标签
+      3. UI 选了角色/风格（hair/eyes/outfit 维度由库提供，天然算提到）
+    """
+    mentioned = set()
+    try:
+        text = str(natural_language or "").lower()
+        for name, _tag_words, user_terms in _CONTROLLED_DIMENSIONS:
+            if text and user_terms:
+                for term in user_terms.split("|"):
+                    term = term.strip().lower()
+                    if term and term in text:
+                        mentioned.add(name)
+                        break
+        # 中文映射直接产出的维度
+        dimension_of = {
+            "quality": "quality",
+            "framing": None,      # framing 里可能混视距/人数，单独判断
+            "character": None,
+            "scene": "scene",
+        }
+        for segment in ("quality", "scene"):
+            for tag in (cn_mapped.get(segment) or ()):
+                dim = _tag_dimension(tag)
+                if dim:
+                    mentioned.add(dim)
+        for segment in ("framing", "character"):
+            for tag in (cn_mapped.get(segment) or ()):
+                dim = _tag_dimension(tag)
+                if dim:
+                    mentioned.add(dim)
+        # 选了角色/风格 -> 角色固有特征维度算有来源
+        config = _normalize_ui(ui)
+        has_character = any(_s(row.get("trigger")) for row in config["character_rows"])
+        has_style = bool(config["style_rows"])
+        if has_character:
+            mentioned.update(("hair", "eyes", "outfit"))
+        if has_style:
+            mentioned.add("scene")
+        return mentioned
+    except Exception:  # noqa: BLE001
+        return mentioned
+
+
+def _template_allowlist(core):
+    """模板 positive 的全部标签 -> ``{key: 原始标签}``（白名单基线）。"""
+    allow = {}
+    try:
+        for row in _split_lines((core or {}).get("positive") or ""):
+            for tag in row:
+                key = _norm_tag_key(tag)
+                if key and key not in allow:
+                    allow[key] = tag
+        return allow
+    except Exception:  # noqa: BLE001
+        return allow
+
+
+def _restructure_rows(rows):
+    """按「正面提示词结构」**强制重排**各段（v11）。
+
+    LLM 常把场景标签塞进角色行（``smile, blue_hair, city, street, night``），
+    不符合「场景画风单独一行」。这里按标签维度重新分组：
+
+    * ``quality`` -> 第 1 行
+    * ``count`` / ``shot`` -> 第 2 行（视距 + 人数 + 多角色动作里的视距人数部分）
+    * ``scene`` -> 最后一行
+    * 其余（hair/eyes/expression/action/gaze/outfit/自由标签）-> 角色行，保持原行序
+
+    多角色时角色行的**行数与相对顺序**保持不变（每行一个角色），只把场景和
+    质量标签抽走，所以不会把两个角色并到一行。
+    """
+    try:
+        quality, framing, scene = [], [], []
+        character_rows = []
+        for row in rows or ():
+            keep = []
+            for tag in row:
+                dimension = _tag_dimension(tag)
+                if dimension == "quality":
+                    quality.append(tag)
+                elif dimension in ("count", "shot"):
+                    framing.append(tag)
+                elif dimension == "scene":
+                    scene.append(tag)
+                else:
+                    keep.append(tag)
+            if keep:
+                character_rows.append(keep)
+        ordered = []
+        if quality:
+            ordered.append(quality)
+        if framing:
+            ordered.append(framing)
+        ordered.extend(character_rows)
+        if scene:
+            ordered.append(scene)
+        return ordered
+    except Exception:  # noqa: BLE001
+        return rows
+
+
+def _enforce_tag_sources(positive, core, natural_language, ui, cn_mapped):
+    """v11 核心：删除无来源标签、补回确定性标签、记录来源。
+
+    :returns: ``(new_positive, info)``，``info`` 含 ``tag_sources`` /
+        ``dropped`` / ``enforced`` / ``lines``。
+    """
+    info = {"tag_sources": {}, "dropped": [], "enforced": [], "lines": 0}
+    try:
+        rows = _split_lines(positive)
+        if not rows:
+            return positive, info
+        allow = _template_allowlist(core)
+        mentioned = _mentioned_dimensions(natural_language, cn_mapped, ui)
+        user_tokens = set(
+            re.findall(r"[a-z0-9_']+", str(natural_language or "").lower()))
+        kept_rows = []
+        for row in rows:
+            kept = []
+            for tag in row:
+                key = _norm_tag_key(tag)
+                if not key:
+                    continue
+                if key in allow:
+                    kept.append(tag)
+                    info["tag_sources"][key] = "template"
+                    continue
+                # 用户原文英文词元全覆盖 -> 有来源
+                words = re.findall(r"[a-z0-9_']+", key)
+                if words and all(word in user_tokens for word in words):
+                    kept.append(tag)
+                    info["tag_sources"][key] = "user_text"
+                    continue
+                # 收紧（lead 要求「没有任何来源的标签直接删掉」）：
+                # 不再因为「用户提到过这个维度」就放行 —— 用户说「蓝发」不代表可以加
+                # long_hair / twintails / colored_inner_hair。只有白名单（角色库、
+                # 风格库、中文映射、质量默认、模板里的用户英文）和用户原文英文词元
+                # 才算有来源。这样「一个蓝发少女」不会冒出任何编造标签。
+                dim = _tag_dimension(tag)
+                reason = "unmentioned_%s" % (dim or "free_tag")
+                info["dropped"].append({"tag": tag, "reason": reason})
+            if kept:
+                kept_rows.append(kept)
+
+        # 补回确定性映射里 LLM 漏掉的标签（按段归位）
+        enforced = _enforce_cn_segments(kept_rows, cn_mapped, info)
+        rows = enforced
+
+        # 角色数量补齐（结构第 2 行要求有）
+        rows = _enforce_character_count(rows, ui, cn_mapped, info)
+
+        if not rows:
+            return positive, info
+        # 按「正面提示词结构」重排：质量 / 视距+人数 / 每角色一行 / 场景
+        rows = _restructure_rows(rows)
+        info["lines"] = len(rows)
+        return _join_lines(rows), info
+    except Exception as exc:  # noqa: BLE001 - 来源校验失败绝不拖垮出图
+        _log(f"_enforce_tag_sources 异常（原样返回）：{type(exc).__name__}: {exc}")
+        return positive, info
+
+
+def _find_segment_row(rows, dimension):
+    """按维度找目标行；找不到返回 ``None``。
+
+    行定位靠「该行是否含这个维度的标签」，不依赖固定行号（LLM 可能省略某行）。
+    """
+    for index, row in enumerate(rows):
+        for tag in row:
+            if _tag_dimension(tag) == dimension:
+                return index
+    return None
+
+
+def _append_to_row(rows, index, tags, sources, info):
+    """把 ``tags`` 追加到第 ``index`` 行（去重后）；``index`` 为 ``None`` 时新增行。"""
+    existing = {_norm_tag_key(tag) for row in rows for tag in row}
+    fresh = []
+    for tag in tags:
+        key = _norm_tag_key(tag)
+        if not key or key in existing:
+            continue
+        existing.add(key)
+        fresh.append(tag)
+        sources[key] = "enforced_cn_map"
+        info["enforced"].append(tag)
+    if not fresh:
+        return rows
+    if index is None or index < 0 or index >= len(rows):
+        rows.append(fresh)
+    else:
+        rows[index].extend(fresh)
+    return rows
+
+
+def _enforce_cn_segments(rows, cn_mapped, info):
+    """修 1：中文映射命中的标签**强制出现**在最终 positive 里（按段归位）。"""
+    sources = info["tag_sources"]
+    quality = cn_mapped.get("quality") or ()
+    framing = cn_mapped.get("framing") or ()
+    scene = cn_mapped.get("scene") or ()
+    if quality:
+        index = _find_segment_row(rows, "quality")
+        if index is None and rows:
+            rows.insert(0, [])
+            index = 0
+        rows = _append_to_row(rows, index, quality, sources, info)
+    if framing:
+        index = _find_segment_row(rows, "count")
+        if index is None:
+            index = _find_segment_row(rows, "shot")
+        if index is None:
+            quality_index = _find_segment_row(rows, "quality")
+            insert_at = 1 if quality_index == 0 else 0
+            rows.insert(insert_at, [])
+            index = insert_at
+        rows = _append_to_row(rows, index, framing, sources, info)
+    if scene:
+        index = _find_segment_row(rows, "scene")
+        rows = _append_to_row(rows, index, scene, sources, info)
+    return rows
+
+
+def _infer_character_count(ui):
+    """按 UI 里的角色行数推人数标签（修 2）。
+
+    ``characters.json`` 没有性别字段，所以：
+      * 1 个角色 -> ``1girl``（danbooru 动漫图绝大多数为女性）
+      * 2 个 -> ``2girls``
+      * 3 个及以上 -> ``Ngirls``
+      * 0 个 -> ``1girl``（结构要求第 2 行至少有人数）
+    返回值同时带 ``solo``（单人时）。
+    """
+    try:
+        config = _normalize_ui(ui)
+        count = sum(
+            1 for row in config["character_rows"] if _s(row.get("trigger")))
+        count = max(1, count)
+        if count == 1:
+            return ["1girl", "solo"]
+        return ["%dgirls" % count]
+    except Exception:  # noqa: BLE001
+        return ["1girl"]
+
+
+def _enforce_character_count(rows, ui, cn_mapped, info):
+    """修 2：把人数标签补到第 2 行；用户明确说过人数时以用户为准。"""
+    try:
+        sources = info["tag_sources"]
+        explicit = [tag for tag in (cn_mapped.get("framing") or ())
+                    if _tag_dimension(tag) == "count"]
+        targets = explicit or _infer_character_count(ui)
+        existing = {_norm_tag_key(tag) for row in rows for tag in row}
+        # 已经有任何一个 count 标签就不重复补（solo 与 2girls 互斥，只留一个口径）
+        has_count = any(
+            _tag_dimension(tag) == "count" for row in rows for tag in row)
+        if has_count:
+            return rows
+        index = _find_segment_row(rows, "shot")
+        if index is None:
+            quality_index = _find_segment_row(rows, "quality")
+            insert_at = 1 if quality_index == 0 else 0
+            rows.insert(insert_at, [])
+            index = insert_at
+        fresh = []
+        for tag in targets:
+            key = _norm_tag_key(tag)
+            if key and key not in existing:
+                existing.add(key)
+                fresh.append(tag)
+                sources[key] = "count_inferred"
+                info["enforced"].append(tag)
+        if fresh:
+            rows[index].extend(fresh)
+        return rows
+    except Exception:  # noqa: BLE001
+        return rows
+
+
 def _ensure_garment_after_override(positive, core):
     """覆盖触发后，保证 positive 至少有一个服装标签（P0 兜底）。
 
@@ -2425,14 +3024,33 @@ def _ensure_garment_after_override(positive, core):
         supplement = [word for word in (override.get("new_garments") or []) if word]
         if not supplement:
             return positive, info
-        text = str(positive).strip().rstrip(",").strip()
-        merged = (text + ", " + ", ".join(supplement)) if text \
-            else ", ".join(supplement)
+        rows = _split_lines(positive)
+        if not rows:
+            rows = [list(supplement)]
+            info["supplemented"] = True
+            info["added"] = supplement
+            return _join_lines(rows), info
+        # v10：服装必须追加到**角色行**，不能落到最后的场景行。
+        # 角色行的判据：该行含 `injected_triggers` 里的角色主体特征/触发词。
+        triggers = {
+            str(token).strip().lower()
+            for token in ((core_debug.get("injected_triggers") or []))
+            if str(token).strip()
+        }
+        target = None
+        for index, row in enumerate(rows):
+            if any(str(tag).strip().lower() in triggers for tag in row):
+                target = index
+                break
+        if target is None:
+            target = len(rows) - 1   # 兜底：无法定位角色行时追加到最后一行
+        rows[target].extend(supplement)
         info["supplemented"] = True
         info["added"] = supplement
-        _log("标签库 agent 前置兜底：覆盖后 LLM 未写服装，已补 %s"
-             % ", ".join(supplement))
-        return merged, info
+        info["line_index"] = target
+        _log("标签库 agent 前置兜底：覆盖后 LLM 未写服装，已补 %s（第 %d 行）"
+             % (", ".join(supplement), target + 1))
+        return _join_lines(rows), info
     except Exception as exc:  # noqa: BLE001 - 兜底失败就保持原样
         _log(f"_ensure_garment_after_override 异常（保持原样）："
              f"{type(exc).__name__}: {exc}")
@@ -2948,6 +3566,21 @@ def _rewrite_only(llm, natural_language, ui, data=None, core=None):
         tagdb_debug = dict(tagdb_debug)
         tagdb_debug["agent"] = tagdb_agent_debug
 
+    # v11 修 1 + 修 3（放在 agent **之后**）：agent 可能回退第 1 轮结果、
+    # 也可能带进新的无来源标签，所以来源校验必须是最终一道门。
+    _core_debug = core.get("debug") if isinstance(core, dict) else {}
+    _core_debug = _core_debug if isinstance(_core_debug, dict) else {}
+    positive, source_info = _enforce_tag_sources(
+        positive, core, natural_language, ui,
+        _core_debug.get("cn_segments") or {})
+    if isinstance(tagdb_debug, dict):
+        tagdb_debug = dict(tagdb_debug)
+    else:
+        tagdb_debug = {}
+    tagdb_debug["tag_sources"] = dict(source_info.get("tag_sources") or {})
+    tagdb_debug["dropped"] = list(source_info.get("dropped") or [])
+    tagdb_debug["cn_enforced"] = list(source_info.get("enforced") or [])
+
     # 契约 §14.2（lead 裁决）：**强制并入**模板的 outfit 抑制词，不依赖 LLM 自觉。
     # 必须在 check_anima 之前，让校验看到的就是最终值。
     negative, negative_missing = _merge_suppress_into_negative(
@@ -3086,13 +3719,17 @@ def _rewrite_only(llm, natural_language, ui, data=None, core=None):
     _core_debug = core.get("debug") if isinstance(core, dict) else {}
     if isinstance(_core_debug, dict):
         for _key in ("cjk_cleaned", "cjk_removed_chars", "cjk_fallback",
-                     "outfit_override"):
+                     "outfit_override", "cn_mapped", "cn_dropped",
+                     "quality_default", "count_inferred"):
             if _key in _core_debug:
                 debug[_key] = _core_debug[_key]
     # 覆盖兜底的信息在 tagdb_debug 里更全（含 garment_supplemented），优先用它
     if isinstance(tagdb_debug, dict) and isinstance(
             tagdb_debug.get("outfit_override"), dict):
         debug["outfit_override"] = tagdb_debug["outfit_override"]
+    # v11：多行行数在 LLM 路径也要按**最终** positive 重算（之前只有模板路径设置，
+    # LLM 改写后行数会变，debug 里却是模板的数，属观测错误）
+    debug["segment_lines"] = len(str(positive or "").splitlines())
     debug.update(extra)
     return {
         "ok": True,

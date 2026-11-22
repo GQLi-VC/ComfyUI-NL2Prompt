@@ -1,5 +1,3 @@
-# SPDX-License-Identifier: AGPL-3.0-only
-# Copyright (C) 2026 GQLI-VC
 """HTTP 路由（backend-core）。契约 ``docs/接口契约.md`` §6。
 
 全部注册在 ``server.PromptServer.instance.routes``（aiohttp ``RouteTableDef``），
@@ -990,6 +988,7 @@ async def _handle_rewrite(request):
     retried = bool(debug.get("retried"))
     if isinstance(skill_check, dict) and skill_check.get("retried"):
         retried = True
+    _dbg_tagdb = debug.get("tagdb") if isinstance(debug.get("tagdb"), dict) else {}
     return {
         "ok": True,
         "positive": result.get("positive", ""),
@@ -1004,6 +1003,14 @@ async def _handle_rewrite(request):
             "negative_missing": negative_missing,
             # 标签库归一结果：用户必须能看到哪些标签被改写，否则改动是隐形的
             "tagdb": debug.get("tagdb") if isinstance(debug.get("tagdb"), dict) else None,
+            # 多行分段（v11）：行数、中文映射命中、被删的无来源标签
+            "segment_lines": debug.get("segment_lines"),
+            "cn_mapped": debug.get("cn_mapped") or [],
+            "quality_default": bool(debug.get("quality_default")),
+            # 标签来源校验：用户排查"为什么某个标签不见了"时需要
+            "tag_sources": _dbg_tagdb.get("tag_sources") or {},
+            "dropped": _dbg_tagdb.get("dropped") or [],
+            "cn_enforced": _dbg_tagdb.get("cn_enforced") or [],
             # 本次生效的 token 优化开关，便于排查"为什么没有省 token"
             "prompt_opt": debug.get("prompt_opt") if isinstance(debug.get("prompt_opt"), dict) else None,
             # 中文清理：用户排查"为什么我的中文不见了"时需要

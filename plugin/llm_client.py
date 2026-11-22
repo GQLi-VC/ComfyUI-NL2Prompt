@@ -1,5 +1,3 @@
-# SPDX-License-Identifier: AGPL-3.0-only
-# Copyright (C) 2026 GQLI-VC
 """LLM 调用层（backend-core）。
 
 契约：``docs/接口契约.md`` §7（LLM 调用契约）/ §8（错误码）
