@@ -906,6 +906,131 @@ def normalize_token(token, whitelist=(), min_conf=DEFAULT_MIN_CONFIDENCE):
         return result
 
 
+#: 角色 tag 解析的默认最低使用量（过滤掉几乎没人用的同名角色）
+CHARACTER_MIN_POSTS = 200
+
+
+def resolve_character_tag(candidates, min_posts=None):
+    """把角色的若干候选名解析成 danbooru 库里的**标准角色 tag**（v15）。
+
+    为什么需要这个（lead 核实）：
+      * ``castorice`` 裸 id 在库里 NOT FOUND（只有 ``castorice_(honkai:_star_rail)``）
+      * ``firefly`` 裸 id 是 general「萤火虫」（510 posts）
+      * ``sparkle`` 裸 id 是 general「闪光」（228739 posts）
+    所以直接拿 id 当 trigger 会匹配到空 / 完全无关的概念。
+
+    解析链：多候选 + ``category == 4`` 校验 + 按 ``post_count`` 取最大。
+    这样 ``miyabi`` 的候选里「星见雅」-> ``hoshimi_miyabi``(7794) 会击败
+    alias 表里错误的 ``hanasaki_miyabi``(675)。
+
+    :param candidates: 候选名集合（角色 id / aliases / activation_words[0]）
+    :param min_posts: 最低使用量，默认 :data:`CHARACTER_MIN_POSTS`
+    :returns: ``(tag_name 或 "", info)``；解析失败时 ``tag_name`` 为空串
+    """
+    info = {"candidates": [], "found": {}, "via": "", "reason": ""}
+    try:
+        threshold = CHARACTER_MIN_POSTS if min_posts is None else int(min_posts)
+    except Exception:  # noqa: BLE001
+        threshold = CHARACTER_MIN_POSTS
+
+    names = []
+    try:
+        for candidate in (candidates or ()):
+            text = str(candidate if candidate is not None else "").strip()
+            if text and text not in names:
+                names.append(text)
+        info["candidates"] = list(names)
+    except Exception:  # noqa: BLE001
+        return "", info
+
+    if not names:
+        info["reason"] = "no_candidates"
+        return "", info
+    if not available():
+        info["reason"] = "db_unavailable"
+        return "", info
+
+    found = {}
+
+    def _take(name, category, posts):
+        try:
+            if category != 4:
+                return
+            posts = int(posts or 0)
+        except Exception:  # noqa: BLE001
+            return
+        if posts < threshold:
+            return
+        if posts > found.get(name, -1):
+            found[name] = posts
+
+    try:
+        for text in names:
+            # 1) alias 表（is_best=1 AND ambiguous=0）
+            try:
+                rows = _query(
+                    "SELECT a.tag_name, t.category, t.post_count "
+                    "FROM tag_alias a LEFT JOIN tag t ON t.name = a.tag_name "
+                    "WHERE a.alias = ? COLLATE NOCASE "
+                    "AND a.is_best = 1 AND a.ambiguous = 0", (text,))
+            except Exception:  # noqa: BLE001
+                rows = []
+            for row in rows:
+                if row and len(row) >= 3:
+                    _take(row[0], row[1], row[2])
+                    if row[1] == 4:
+                        info["via"] = info["via"] or "tag_alias"
+            # 2) 直接查 tag 表（空格 -> 下划线）
+            key = "_".join(text.split())
+            if not key:
+                continue
+            try:
+                direct = _query(
+                    "SELECT name, category, post_count FROM tag "
+                    "WHERE name = ? COLLATE NOCASE", (key,))
+            except Exception:  # noqa: BLE001
+                direct = []
+            for row in direct:
+                if row and len(row) >= 3:
+                    before = len(found)
+                    _take(row[0], row[1], row[2])
+                    if len(found) > before:
+                        info["via"] = info["via"] or "tag_exact"
+    except Exception as exc:  # noqa: BLE001
+        _warn("resolve_character_tag 异常（返回空）：%s" % exc)
+        info["reason"] = "internal_error"
+        return "", info
+
+    info["found"] = dict(found)
+    if not found:
+        info["reason"] = "not_found"
+        return "", info
+    best_name = max(found.items(), key=lambda item: item[1])[0]
+    info["posts"] = found[best_name]
+    return best_name, info
+
+
+def escape_tag_brackets(tag):
+    """把标签里的字面括号转义成 ``\\(`` ``\\)``（v15）。
+
+    ComfyUI 的 ``escape_important`` / ``unescape_important`` 会在
+    ``parse_parentheses`` 之前把 ``\\(`` ``\\)`` 换成占位符，
+    分词后再还原成字面括号 —— 所以转义后既不会被当权重语法，CLIP 又能收到
+    正确的字符串。这是 danbooru tag 转 prompt 的标准做法。
+    """
+    try:
+        text = str(tag if tag is not None else "")
+        if not text:
+            return text
+        # 已转义的不重复加
+        text = text.replace("\\(", "\0").replace("\\)", "\1")
+        text = text.replace("(", "\\(").replace(")", "\\)")
+        text = text.replace("\0", "\\(").replace("\1", "\\)")
+        return text
+    except Exception:  # noqa: BLE001
+        return tag
+
+
 def split_tags(text):
     """按英文逗号**或换行**切标签（保留顺序、丢弃空项）。
 

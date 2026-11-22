@@ -223,8 +223,13 @@ def _split_tags(text: str) -> "list[str]":
 
 
 def _bare_tag(tag: str) -> str:
-    """剥掉合法权重包裹，返回裸标签（``(long hair:1.2)`` -> ``long hair``）。"""
-    text = str(tag or "").strip()
+    """剥掉合法权重包裹，返回裸标签（``(long hair:1.2)`` -> ``long hair``）。
+
+    v15：同时**去掉反斜杠转义** —— 角色 trigger 在最终 positive 里是
+    ``castorice_\\(honkai:_star_rail\\)``，而 required_tokens 是未转义的
+    ``castorice_(honkai:_star_rail)``。两者必须能对上，否则 skill_check 误判缺失。
+    """
+    text = str(tag or "").strip().replace('\\', "").replace('\\\\', "")
     try:
         for _ in range(3):
             if not (text.startswith("(") and text.endswith(")")):

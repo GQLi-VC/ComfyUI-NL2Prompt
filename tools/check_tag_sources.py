@@ -173,7 +173,7 @@ def main():
               bool(tagdb.get("tag_sources")), str(tagdb.get("tag_sources")))
         check("来源值在允许集合内",
               all(value in ("template", "user_text", "enforced_cn_map",
-                            "count_inferred")
+                            "count_inferred", "enforced")
                   for value in (tagdb.get("tag_sources") or {}).values()),
               str(set((tagdb.get("tag_sources") or {}).values())))
         check("仍是多行结构", len(positive.split("\n")) >= 2, repr(positive))

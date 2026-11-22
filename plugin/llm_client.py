@@ -173,6 +173,38 @@ def _first_balanced_object(text):
     return None
 
 
+_JSON_LEGAL_ESC = set('"\\/bfnrtu')
+
+
+def _fix_invalid_escapes(text):
+    r"""把 JSON 字符串里非法的 \X 转义修成字面 \X。
+
+    JSON 规范只允许 \\ \" \/ \b \f \n \r \t \uXXXX；
+    模型常把角色 tag 的括号写成 \( \)，这是非法转义，json.loads 会直接失败。
+    这里把非法项前面补一个 \，使其成为合法 JSON 且**保留原始字符**。
+    """
+    out = []
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char != '\\':
+            out.append(char)
+            index += 1
+            continue
+        nxt = text[index + 1] if index + 1 < length else ""
+        if nxt in _JSON_LEGAL_ESC:
+            out.append(char)
+            out.append(nxt)
+            index += 2
+            continue
+        # 非法转义：补一个反斜杠，令其在 JSON 中表示字面反斜杠
+        out.append('\\')
+        out.append('\\')
+        index += 1
+    return "".join(out)
+
+
 def parse_json(text):
     """把模型输出解析成 dict。
 
@@ -190,6 +222,19 @@ def parse_json(text):
     stripped = text.strip()
     if not stripped:
         return None
+
+    # 0) 先修掉 JSON 字符串内的**非法反斜杠转义**再解析：
+    #    模型（被 skill 教过「括号要转义」）常输出 castorice_\\(honkai:_star_rail\\)，
+    #    而 JSON 只允许 \\ " / b f n r t u —— \\( 是非法转义，直接 json.loads 必失败，
+    #    表现为 llm_bad_json 回退模板（v15.8 修）。把非法 \X 变成字面 \X（JSON 合法）。
+    fixed = _fix_invalid_escapes(stripped)
+    if fixed != stripped:
+        try:
+            parsed = json.loads(fixed)
+            if isinstance(parsed, dict):
+                return parsed
+        except (ValueError, TypeError):
+            pass
 
     # 1) 直接解析
     try:

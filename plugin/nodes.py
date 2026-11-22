@@ -1672,9 +1672,54 @@ def _compose_core(natural_language, ui, data=None):
         "scene": list(cn_mapped.get("scene") or ()),
     }
 
+    # v14：从**自然语言正文**扫描角色别名（用户输入基本是长句，
+    # 长句里带角色名最自然，不能要求每条都去下拉框选）。
+    # 与 ui.character_rows 合并去重；命中记 debug.characters_from_text。
+    text_rows = _scan_characters_in_text(
+        language, view, config["character_rows"], data)
+    all_rows = list(config["character_rows"]) + list(text_rows)
+    if text_rows:
+        debug["characters_from_text"] = [
+            _s(row.get("name")) for row in text_rows if _s(row.get("name"))
+        ]
+        debug["characters_from_text_match"] = [
+            _s(row.get("_matched_alias")) for row in text_rows
+        ]
+    # v14：所有角色纯 id（括号护栏用）
+    character_ids = _collect_character_ids(view)
+    debug["character_ids"] = list(character_ids)
+    # v14.2：**最终**角色数（含正文识别的）—— 多角色时服装映射要留给 LLM 分配
+    debug["final_character_count"] = sum(
+        1 for _row in all_rows if _s(_row.get("trigger")))
+    # v15.3：角色 id -> 库标准 tag（裸 id 补全用；LLM 路径也从 core debug 读）
+    character_tag_map = {}
+    try:
+        _catalog = view.catalog() or {}
+        for _char in (_catalog.get("characters") or []):
+            _cid = _s(_char.get("id"))
+            if not _cid:
+                continue
+            _tag = _resolve_character_tag(_char)
+            if _tag:
+                character_tag_map[_cid] = _tag
+    except Exception:  # noqa: BLE001
+        character_tag_map = {}
+    debug["character_tag_map"] = dict(character_tag_map)
+    # v15.5：本次**参与**的角色（按行顺序）的库标准 tag，供强制注入用
+    _active_tags = []
+    for _row in all_rows:
+        if not _s(_row.get("trigger")):
+            continue
+        _char = view.resolve_character(_s(_row.get("name"))) \
+            if _s(_row.get("name")) else None
+        _tag = _resolve_character_tag(_char) if _char else ""
+        if _tag:
+            _active_tags.append(_tag)
+    debug["active_character_tags"] = _active_tags
+
     # v12：角色性别表（供人数推断；characters.json 的 gender 字段）
     gender_map = {}
-    for row in config["character_rows"]:
+    for row in all_rows:
         name = _s(row.get("name"))
         if not name:
             continue
@@ -1685,14 +1730,21 @@ def _compose_core(natural_language, ui, data=None):
 
     # v12：用户手填的 trigger（库名规范化时要跳过，契约 §5 要求原样保留）
     user_triggers = []
-    for row in config["character_rows"]:
+    for row in all_rows:
         user_triggers.extend(_split_tokens(row.get("trigger")))
+        # v15：解析后的**库标准 tag** 也要保护（否则会被 tagdb 规范化改名）
+        _row_character = view.resolve_character(_s(row.get("name"))) \
+            if _s(row.get("name")) else None
+        if _row_character:
+            _resolved = _resolve_character_tag(_row_character)
+            if _resolved:
+                user_triggers.append(_resolved)
     for row in config["style_rows"]:
         user_triggers.extend(_split_tokens(row.get("trigger")))
     debug["user_triggers"] = _dedupe_tokens(user_triggers)
 
     # ---------------- 角色行（契约 §5 第一段）
-    for row in config["character_rows"]:
+    for row in all_rows:
         hint_consumed_by_preset = False
         # v10：每个角色单独一行（多角色时各占一行，见「正面提示词结构」）
         char_parts = []
@@ -1708,11 +1760,33 @@ def _compose_core(natural_language, ui, data=None):
                 )
             continue
 
-        char_parts.extend(_split_tokens(trigger))
-
         name = _s(row.get("name"))
         hint = _s(row.get("outfit_hint"))
         character = view.resolve_character(name) if name else None
+
+        # v15：trigger 一律用**库标准 tag**（不是纯 id —— 裸 id 在库里可能不存在，
+        # 或命中「萤火虫」「闪光」这种完全无关的 general 概念）
+        resolved_trigger = _resolve_character_tag(character) if character else ""
+        # v15.7：**只有** trigger 本身就是角色 id / 别名时才替换成库标准 tag。
+        # 用户手填的自定义 trigger（如 `my_custom_trigger`）必须原样保留 ——
+        # 契约 §5 触发词保护优先于「库名规范化」。
+        _trigger_key = _norm_tag_key(trigger)
+        # 注意：**不能**把 trigger 自己放进这个集合，否则永远命中、自定义 trigger 会被覆盖
+        _character_keys = set()
+        if character:
+            _character_keys.add(_norm_tag_key(_s(character.get("id"))))
+            for _alias in _as_list(character.get("aliases")):
+                _character_keys.add(_norm_tag_key(_s(_alias)))
+        if resolved_trigger and _trigger_key in _character_keys:
+            trigger_to_use = resolved_trigger
+        else:
+            trigger_to_use = trigger
+            if resolved_trigger:
+                debug.setdefault("trigger_kept_custom", []).append(trigger)
+        if not resolved_trigger:
+            debug["trigger_unresolved"] = debug.get("trigger_unresolved") or []
+            debug["trigger_unresolved"].append(name or trigger)
+        char_parts.extend(_split_tokens(trigger_to_use))
 
         if character:
             display_name = _s(_first(character, ("display_name", "name", "id"))) or name
@@ -1734,6 +1808,19 @@ def _compose_core(natural_language, ui, data=None):
                 )
 
             activation = _split_tokens(_first(character, _WORD_KEYS))
+            # v15：activation_words[0] 是角色名（可能是 `firefly (honkai: star rail)`
+            # 这种带括号的写法），统一替换成库标准 tag，避免与 trigger 重复或写法不一致
+            if activation and resolved_trigger:
+                if _norm_tag_key(activation[0]) in {
+                        _norm_tag_key(trigger),
+                        _norm_tag_key(resolved_trigger),
+                }:
+                    activation = [resolved_trigger] + activation[1:]
+                elif _norm_tag_key(activation[0]) in {
+                        _norm_tag_key(alias)
+                        for alias in _as_list(character.get("aliases"))
+                }:
+                    activation = [resolved_trigger] + activation[1:]
             char_parts.extend(activation)
             debug["injected_triggers"].extend(activation)
 
@@ -1749,17 +1836,32 @@ def _compose_core(natural_language, ui, data=None):
                 # **服装类**标签不再注入 positive，改注入 negative 抑制；
                 # **角色主体特征**（发色/瞳色/发饰）必须保留 —— 换裙子不是换发饰。
                 # 检测不到覆盖意图时，走原有逻辑，行为一字不变。
-                override = detect_outfit_override(natural_language, outfit)
+                # v14.1：正文识别的角色只用自己的那一段做服装检测，
+                # 避免「遐蝶穿黑裙，流萤穿白裙」两个角色的服装互相污染
+                role_text = natural_language
+                if row.get("_from_text"):
+                    role_text = _character_text_segment(
+                        natural_language, row.get("_matched_alias"),
+                        _text_match_aliases(text_rows))
+                override = detect_outfit_override(role_text, outfit)
                 if override["override"]:
                     body_tags, clothing_tags = split_body_and_clothing(character, outfit)
                     char_parts.extend(body_tags)
                     debug["injected_triggers"].extend(body_tags)
-                    for word in clothing_tags:
-                        negative_parts.append(word)
-                        debug["negative_suppress_source"]["outfit"].append(word)
                     # P0：删掉旧服装后**必须补上新服装**，否则角色会"光着"。
                     # 模板路径没法靠 LLM 翻译中文，代码侧直接从用户描述提取。
-                    new_garments = extract_garment_tags(natural_language)
+                    # v15.9：必须**先算新装**——原装里与新装重叠的标签不能压 negative。
+                    new_garments = extract_garment_tags(role_text)
+                    new_keys = {_norm_tag_key(tag) for tag in new_garments}
+                    new_keys.discard("")
+                    for word in clothing_tags:
+                        # v15.9：原装与新装同色同款（white dress vs white_dress）
+                        # 时，压进 negative 会直接压掉用户要的白裙，且会让
+                        # skill_check 的 negative_missing 与 positive 自相矛盾。
+                        if _norm_tag_key(word) in new_keys:
+                            continue
+                        negative_parts.append(word)
+                        debug["negative_suppress_source"]["outfit"].append(word)
                     char_parts.extend(new_garments)
                     debug["outfit_override"] = {
                         "detected": True,
@@ -1789,6 +1891,13 @@ def _compose_core(natural_language, ui, data=None):
             if outfit is not None:
                 keep_tokens.extend(_split_tokens(_first(outfit, _WORD_KEYS)))
             keep_lower = {token.lower() for token in keep_tokens}
+            # v15.9：本次换装新增的服装也要进 keep —— 否则 sibling 的
+            # `white dress` 会经由差集抑制把用户要的 `white_dress` 压掉。
+            _new_garment_keys = set()
+            for _item in (debug.get("outfit_override") or {}).get("new_garments") or ():
+                _key = _norm_tag_key(_item)
+                if _key:
+                    _new_garment_keys.add(_key)
             debug["negative_suppress_source"]["character"].extend(character_activation)
 
             for sibling in siblings:
@@ -1800,6 +1909,8 @@ def _compose_core(natural_language, ui, data=None):
                 for word in ordered:
                     if word.lower() in keep_lower:
                         continue  # 与当前服装/角色共享的词，不自伤
+                    if _norm_tag_key(word) in _new_garment_keys:
+                        continue  # v15.9：不许压掉用户本次要的新服装
                     negative_parts.append(word)
                     debug["negative_suppress_source"]["outfit"].append(word)
 
@@ -1884,7 +1995,16 @@ def _compose_core(natural_language, ui, data=None):
             # 剩下的全是中文：没有可用于正向提示词的英文内容
             leftover_all_cjk = True
     if leftover_clean:
-        seg_scene.extend(_split_tokens(leftover_clean))
+        # v14.1：词数 > 5 的英文片段是**句子**不是标签，CLIP 对长句效果差，
+        # 塞进 positive 只会稀释权重；记进 debug 供排查。
+        _sentence_parts = []
+        for _piece in _split_tokens(leftover_clean):
+            if len(_piece.split()) > 5:
+                _sentence_parts.append(_piece)
+                continue
+            seg_scene.append(_piece)
+        if _sentence_parts:
+            debug["en_sentence_skipped"] = _sentence_parts
 
     # v10：质量标签是模型的**必需渲染参数**，不是"编造用户没描述的内容"。
     # 用户明确说了质量词（高清等）就用用户的；没说就补默认三件套。
@@ -1899,8 +2019,11 @@ def _compose_core(natural_language, ui, data=None):
     # v11 修 2：第 2 行必须有人数（正面提示词结构）。放在 has_content 之后，
     # 避免「补了 1girl 就不算空内容」破坏 cjk_fallback 的判定。
     if not any(_tag_dimension(tag) == "count" for tag in seg_framing):
+        # v14：人数要把「正文识别出的角色」一起算进去
+        _count_config = dict(config)
+        _count_config["character_rows"] = all_rows
         _count_tags, _gender_assumed = _infer_character_count(
-            config, debug.get("gender_map"))
+            _count_config, debug.get("gender_map"))
         seg_framing.extend(_count_tags)
         debug["count_inferred"] = True
         if _gender_assumed:
@@ -1910,7 +2033,12 @@ def _compose_core(natural_language, ui, data=None):
     # 「在微笑」-> smile）也要进模板 positive，否则 LLM 路径的来源白名单里没有它们，
     # 会被误判为「无来源」删掉。没有角色行时单独成一行（用户描述的角色特征）。
     cn_character = list(cn_mapped.get("character") or ())
-    if cn_character:
+    # v14.2：**多角色时不注入** character 段。
+    # 「遐蝶穿黑色长裙，流萤穿白色长裙」扫描出的 character 段同时含
+    # black dress 和 white dress，全塞进第一行会让遐蝶一件黑一件白（自相矛盾）。
+    # 多角色时服装归属交给各自的 outfit 覆盖检测（已按角色名切段），
+    # 共享动作（walking）也交给 LLM 补。
+    if cn_character and len(seg_characters) <= 1:
         if seg_characters:
             seg_characters[0].extend(cn_character)
         else:
@@ -1936,6 +2064,36 @@ def _compose_core(natural_language, ui, data=None):
         fallback = (positive_base or "").strip() or "1girl"
         positive = fallback
         debug["cjk_fallback"] = True
+
+    # v15.1：**先**写来源表（此时还未转义），再转义，最后按最终写法同步。
+    # 顺序反了会出现「debug 里是未转义写法、positive 里是转义写法」对不上。
+    _tpl_sources = {
+        _norm_tag_key(tag): "template"
+        for row in _split_lines(positive) for tag in row
+        if _norm_tag_key(tag)
+    }
+    debug["tag_sources"] = dict(_tpl_sources)
+    # 与 LLM 路径同结构：debug["tagdb"]["tag_sources"]，
+    # 否则 LLM 回退模板时「标签数 == tag_sources 条数」这条验收不成立
+    if not isinstance(debug.get("tagdb"), dict):
+        debug["tagdb"] = {
+            "enabled": True, "available": True, "applied": False,
+            "reason": "template_only", "tag_sources": dict(_tpl_sources),
+        }
+
+    # v15：括号**转义**（不是删掉全名）—— ComfyUI 的 escape_important 保证安全
+    positive, _bracket_escaped = _escape_brackets(positive, debug)
+    if _bracket_escaped:
+        debug["bracket_escaped"] = list(_bracket_escaped)
+        # 按最终（转义后）写法同步 debug key
+        _final_tpl_sources = {
+            _norm_tag_key(tag): "template"
+            for row in _split_lines(positive) for tag in row
+            if _norm_tag_key(tag)
+        }
+        debug["tag_sources"] = dict(_final_tpl_sources)
+        if isinstance(debug.get("tagdb"), dict):
+            debug["tagdb"]["tag_sources"] = dict(_final_tpl_sources)
 
     # 分段结构自检信息（便于前端与日志核对）
     debug["segment_lines"] = len(positive.splitlines())
@@ -2199,6 +2357,16 @@ def _load_skill(skill_id=None):
                 if isinstance(skill, dict) and skill:
                     return skill
     return _builtin_skill(target)
+
+
+def _escape_single_tag(tag):
+    """单个标签的括号转义（供 required_tokens 与最终 positive 对齐）。"""
+    text = _s(tag)
+    if not text or "(" not in text and ")" not in text:
+        return text
+    if '\\(' in text or '\\)' in text:
+        return text
+    return text.replace("(", '\\(').replace(")", '\\)')
 
 
 def _run_skill_check(positive, negative, required_tokens, forbidden_tokens, skill):
@@ -3065,6 +3233,14 @@ def _finalize_positive(positive, tagdb_debug, core, natural_language, ui):
     core_debug = core.get("debug") if isinstance(core, dict) else {}
     core_debug = core_debug if isinstance(core_debug, dict) else {}
     info = dict(tagdb_debug) if isinstance(tagdb_debug, dict) else {}
+    if isinstance(core_debug.get("final_character_count"), int):
+        info["final_character_count"] = core_debug["final_character_count"]
+
+    # v15：来源校验之前先做一次兜底（把语义等价的旧写法对齐到库标准 tag），
+    # 真正的**括号转义**放在最后一步（不影响来源校验与去重）
+    positive, _early_bracket = _sanitize_brackets(
+        positive, core_debug.get("character_ids"), info,
+        core_debug.get("character_tag_map"))
 
     positive, source_info = _enforce_tag_sources(
         positive, core, natural_language, ui,
@@ -3074,6 +3250,12 @@ def _finalize_positive(positive, tagdb_debug, core, natural_language, ui):
     info["cn_enforced"] = list(source_info.get("enforced") or [])
     if source_info.get("gender_assumed"):
         info["gender_assumed"] = True
+
+    # v15.5：角色 trigger **强制注入** —— LLM 经常不写 trigger（只写特征），
+    # 而 trigger 不在 cn_map 里，不补就等于「识别到了角色但画面里没有她」。
+    positive = _force_character_triggers(
+        positive, core_debug.get("active_character_tags"), info,
+        core_debug.get("character_tag_map"))
 
     name_info = {}
     positive, rename_map = _normalize_tag_names(
@@ -3099,7 +3281,522 @@ def _finalize_positive(positive, tagdb_debug, core, natural_language, ui):
         info["names_normalized"] = list(name_info["renamed"])
     if name_info.get("name_unknown"):
         info["name_unknown"] = list(name_info["name_unknown"])
+
+    # v15.4：规范化之后**再兜一次裸 id 补全**。
+    # LLM 有时会直接输出 `sparkle` / `firefly` 这种裸 id（它以为"触发词原样保留"
+    # 就是写 id），而裸 id 在库里是「闪光」「萤火虫」这种 general 概念，
+    # 或者根本不存在。这里再跑一次 sanitize 把它们补全成库标准 tag。
+    positive, _late_sanitize = _sanitize_brackets(
+        positive, core_debug.get("character_ids"), info,
+        core_debug.get("character_tag_map"))
+
+    # v15.6：同角色全名与裸 id 并存时删掉裸 id（裸 id 可能是「闪光」这类无关概念）
+    positive, _bare_dropped = _drop_bare_character_ids(
+        positive, core_debug.get("character_tag_map"))
+    if _bare_dropped:
+        info["bare_id_dropped"] = list(_bare_dropped)
+
+    # v15.8：**最终兜底** —— 把 positive 里残留的裸角色 id 升格成库标准 tag。
+    # LLM 路径下 `_force_character_triggers` 有时没生效（core_debug 的来源不同），
+    # 结果输出 `castorice` 而不是 `castorice_(honkai:_star_rail)`；裸 id 在库里
+    # 要么不存在、要么是「萤火虫/闪光」这类无关概念，必须升格。
+    positive, _upgraded = _upgrade_bare_character_ids(
+        positive, core_debug.get("character_tag_map"), info)
+
+    # v15.7：用**最终 positive** 重建来源表，保证「标签数 == tag_sources 条数」。
+    # 前面的强制注入（角色 trigger）会新增标签，不重建就对不上。
+    try:
+        _existing = info.get("tag_sources") or {}
+        _rebuilt = {}
+        for _row in _split_lines(positive):
+            for _tag in _row:
+                _key = _norm_tag_key(_tag)
+                if _key:
+                    _rebuilt[_key] = _existing.get(_key, "enforced")
+        info["tag_sources"] = _rebuilt
+    except Exception:  # noqa: BLE001
+        pass
+
+    # v15：**最后**做括号转义（ComfyUI 的 escape_important 保证安全），
+    # 然后按最终写法再同步一次 debug key，保持「positive 与 debug 一致」
+    positive, _escaped = _escape_brackets(positive, info)
+    if _escaped:
+        (_rs2_src, _rs2_drop, _rs2_enf) = _resync_debug_keys(
+            info.get("tag_sources"), info.get("dropped"),
+            info.get("cn_enforced"), positive)
+        info["tag_sources"] = _rs2_src
+        info["dropped"] = _rs2_drop
+        info["cn_enforced"] = _rs2_enf
     return positive, info
+
+
+# ---------------------------------------------------------------------------
+# v14：自然语言角色识别 + 括号触发词护栏
+# ---------------------------------------------------------------------------
+
+def _collect_character_ids(view):
+    """拿到所有角色的纯 id（用于括号护栏）。"""
+    try:
+        catalog = view.catalog() or {}
+        ids = []
+        for character in _dicts(catalog.get("characters")):
+            char_id = _s(character.get("id"))
+            if char_id:
+                ids.append(char_id)
+        return ids
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _scan_characters_in_text(natural_language, view, existing_rows, data=None):
+    """从自然语言正文里扫描角色别名，返回需要**补充**的虚拟角色行（v14）。
+
+    用户实际输入是长句，长句里带角色名最自然（「遐蝶在雨夜的街头」），
+    不能要求每条都去下拉框选一遍。
+
+    规则：
+      * 扫描 ``aliases``（中文名 / 英文名 / 其它别名），大小写不敏感、子串命中
+      * 已经出现在 ``ui.character_rows`` 里的角色**不重复添加**（按 id / display_name 判重）
+      * 同一角色被多个别名命中只加一次
+      * 虚拟行的 ``trigger`` 用**纯 id**（绝不带括号，括号是权重语法）
+      * ``outfit_hint`` 留空 -> ``resolve_outfit`` 取默认（第一套），
+        用户若在正文里描述了不同服装，``detect_outfit_override`` 会接管
+
+    :returns: ``list[dict]``，每项是可直接混进 ``character_rows`` 的行
+    """
+    added = []
+    try:
+        text = str(natural_language or "").lower()
+        if not text.strip():
+            return added
+        catalog = view.catalog() or {}
+        characters = _dicts(catalog.get("characters"))
+        if not characters:
+            return added
+
+        existing_keys = set()
+        for row in (existing_rows or ()):
+            for field in ("name", "trigger", "id"):
+                value = _norm(row.get(field))
+                if value:
+                    existing_keys.add(value)
+
+        matched_ids = set()
+        for character in characters:
+            char_id = _s(character.get("id"))
+            if not char_id or char_id in matched_ids:
+                continue
+            display = _s(_first(character, ("display_name", "name", "id"))) or char_id
+            aliases = [_s(item) for item in _as_list(character.get("aliases")) if _s(item)]
+            if not aliases:
+                aliases = [display, char_id]
+            hit = None
+            for alias in aliases:
+                if alias and alias.lower() in text:
+                    hit = alias
+                    break
+            if not hit:
+                continue
+            if _norm(char_id) in existing_keys or _norm(display) in existing_keys:
+                # UI 里已经选了这个角色，不重复注入
+                matched_ids.add(char_id)
+                continue
+            matched_ids.add(char_id)
+            added.append({
+                "id": "text_" + char_id,
+                "name": display,
+                "trigger": char_id,          # 纯 id，不带括号
+                "outfit_hint": "",
+                "_from_text": True,
+                "_matched_alias": hit,
+            })
+        return added
+    except Exception as exc:  # noqa: BLE001
+        _log(f"_scan_characters_in_text 异常（跳过正文识别）：{type(exc).__name__}: {exc}")
+        return added
+
+
+def _character_text_segment(natural_language, matched_alias, other_aliases):
+    """从长句里切出「属于该角色」的一段（v14.1）。
+
+    「遐蝶穿黑色长裙，流萤穿白色长裙」按角色名切成两段，
+    各自只对自己的那一段做服装覆盖检测，避免两个角色的服装互相污染。
+
+    :param natural_language: 用户原文
+    :param matched_alias: 该角色命中的别名
+    :param other_aliases: 其它已识别角色的别名（作为分界点）
+    """
+    text = str(natural_language or "")
+    alias = _s(matched_alias)
+    if not text or not alias:
+        return text
+    # v14.2：取**最后一次**出现的位置。
+    # 原文「遐蝶和流萤在公园里散步，遐蝶穿黑色长裙，流萤穿白色长裙」里
+    # 每个角色出现两次：第一次是并列主语（后面紧跟另一个角色名），
+    # 第二次才跟自己的服装描述。用 find 会切到只有名字的那一段。
+    start = text.lower().rfind(alias.lower())
+    if start < 0:
+        return text
+    end = len(text)
+    for other in (other_aliases or ()):
+        other_text = _s(other)
+        if not other_text or other_text.lower() == alias.lower():
+            continue
+        position = text.lower().find(other_text.lower(), start + len(alias))
+        if 0 <= position < end:
+            end = position
+    segment = text[start:end].strip(" ，,。.、；;\n\t")
+    return segment or text
+
+def _text_match_aliases(text_rows):
+    """把所有正文识别角色的命中别名收集起来（做分界点用）。"""
+    aliases = []
+    for row in (text_rows or ()):
+        alias = _s(row.get("_matched_alias"))
+        if alias:
+            aliases.append(alias)
+    return aliases
+
+
+#: 括号 + 冒号（prompt 里是权重语法，角色名里出现会拆坏标签）
+_BRACKET_RE = re.compile(r"[（(]")
+_BRACKET_STRIP_RE = re.compile(r"[（(][^)）]*[)）]")
+#: 常规颜文字白名单（这些括号是内容本身，不处理）
+_BRACKET_SAFE_EMOTICONS = frozenset((
+    "^_^", "^_^;", ">_<", "o_o", "t_t", ";_;;", ":3", ":d", ":p", ":)",
+))
+
+
+def _trigger_base(tag):
+    """把 ``castorice_(honkai:_star_rail)`` 剥成可比较的基础名。"""
+    stripped = _BRACKET_STRIP_RE.sub("", tag or "")
+    stripped = stripped.replace("_", " ").replace(":", " ")
+    return " ".join(stripped.split()).strip().lower()
+
+
+#: 角色 id -> 库标准 tag 的进程内缓存（避免每个角色每次组装都查库）
+_CHARACTER_TAG_CACHE = {}
+
+
+def _resolve_character_tag(character, view=None):
+    """把角色解析成 danbooru 库里的**标准角色 tag**（v15，带括号不转义）。
+
+    为什么不能直接用 id（lead 核实）：
+      * ``castorice`` 裸 id 在库里 NOT FOUND
+      * ``firefly`` 裸 id 是 general「萤火虫」（510 posts）
+      * ``sparkle`` 裸 id 是 general「闪光」（228739 posts）
+    直接用 id 会匹配到空或完全无关的概念，画面必然出错。
+
+    解析链在 ``tagdb.resolve_character_tag``（多候选 + category=4 校验 + posts 最大）；
+    解析失败时**回退纯 id** 并记 ``debug.trigger_unresolved``。
+    """
+    try:
+        char_id = _s((character or {}).get("id"))
+        if not char_id:
+            return ""
+        if char_id in _CHARACTER_TAG_CACHE:
+            return _CHARACTER_TAG_CACHE[char_id]
+        candidates = [char_id]
+        for alias in _as_list((character or {}).get("aliases")):
+            text = _s(alias)
+            if text and text not in candidates:
+                candidates.append(text)
+        words = _as_list((character or {}).get("activation_words"))
+        if words:
+            first = _s(words[0])
+            if first and first not in candidates:
+                candidates.append(first)
+        resolved = ""
+        if _tagdb_mod is not None:
+            resolver = getattr(_tagdb_mod, "resolve_character_tag", None)
+            if callable(resolver):
+                try:
+                    name, _info = resolver(candidates)
+                    resolved = _s(name)
+                except Exception:  # noqa: BLE001
+                    resolved = ""
+        _CHARACTER_TAG_CACHE[char_id] = resolved
+        return resolved
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _upgrade_bare_character_ids(positive, tag_map, info=None):
+    """把 positive 里残留的裸角色 id 升格成库标准 tag（v15.8 最终兜底）。
+
+    与 ``_force_character_triggers`` 的区别：那个是「缺了就补」，
+    这个只在**裸 id 已经存在**时做原地替换，不新增标签，也不改行结构，
+    对模板路径完全无副作用（模板路径本来就没有裸 id）。
+    """
+    mapping = {}
+    for cid, tag in (tag_map or {}).items():
+        bare = _s(cid)
+        full = _s(tag)
+        if bare and full and _norm_tag_key(bare) != _norm_tag_key(full):
+            mapping[_norm_tag_key(bare)] = full
+    if not mapping:
+        return positive, []
+    try:
+        rows = _split_lines(positive)
+    except Exception:  # noqa: BLE001
+        return positive, []
+    present = {_norm_tag_key(tag) for row in rows for tag in row}
+    upgraded = []
+    changed = False
+    for row in rows:
+        for index, item in enumerate(row):
+            full = mapping.get(_norm_tag_key(item))
+            if not full:
+                continue
+            # 已经存在同角色的库标准 tag 时，直接删掉裸 id（避免一条角色两种写法）
+            if _norm_tag_key(full) in present and index < len(row):
+                row[index] = ""
+                changed = True
+                continue
+            row[index] = full
+            present.add(_norm_tag_key(full))
+            upgraded.append(full)
+            changed = True
+    if not changed:
+        return positive, []
+    rows = [[tag for tag in row if tag] for row in rows]
+    rows = [row for row in rows if row]
+    if isinstance(info, dict):
+        sources = info.get("tag_sources")
+        if isinstance(sources, dict):
+            for tag in upgraded:
+                sources[_norm_tag_key(tag)] = "enforced"
+    return _join_lines(rows), upgraded
+
+
+def _force_character_triggers(positive, active_tags, info=None, tag_map=None):
+    """确保每个参与角色的库标准 tag 一定出现在 positive 里（v15.5）。
+
+    LLM 成功路径下模型经常只写角色的特征标签（发色/瞳色/服装），
+    **不写角色 trigger**；而 trigger 不在 cn_map 里，`_enforce_cn_segments`
+    不会补它 —— 结果「识别到了角色，但画面里没有她」。
+
+    :param active_tags: ``["castorice_(honkai:_star_rail)", ...]``（按角色行顺序）
+    """
+    tags = [_s(tag) for tag in (active_tags or ()) if _s(tag)]
+    if not tags:
+        return positive
+    try:
+        rows = _split_lines(positive)
+        if not rows:
+            return _join_lines([[tag] for tag in tags])
+        present = {_norm_tag_key(tag) for row in rows for tag in row}
+        missing = [tag for tag in tags if _norm_tag_key(tag) not in present]
+        if not missing:
+            return positive
+        # v15.6：若 positive 里已经有该角色的**裸 id**（LLM 常这么写），
+        # 直接把它替换成库标准 tag，而不是再追加一个 —— 否则会出现
+        # `sparkle, sparkle_\(honkai:_star_rail\)` 这种一条角色两个写法的重复。
+        id_of_tag = {}
+        for cid, tag in (tag_map or {}).items():
+            key = _norm_tag_key(tag)
+            if key and _s(cid):
+                id_of_tag[key] = _s(cid)
+        still_missing = []
+        for tag in missing:
+            bare = id_of_tag.get(_norm_tag_key(tag))
+            replaced = False
+            if bare:
+                bare_key = _norm_tag_key(bare)
+                for row in rows:
+                    for index, item in enumerate(row):
+                        if _norm_tag_key(item) == bare_key:
+                            row[index] = tag
+                            replaced = True
+                            break
+                    if replaced:
+                        break
+            if not replaced:
+                still_missing.append(tag)
+        missing = still_missing
+        if not missing:
+            payload = info if isinstance(info, dict) else {}
+            payload.setdefault("trigger_renamed", []).extend(tags)
+            return _join_lines(rows)
+        # 追加到对应的角色行（按顺序）；角色行不够就新起一行
+        appended = 0
+        for index, tag in enumerate(missing):
+            char_row = None
+            # 找第 index 个「像角色行」的行（含 outfit/hair/eyes/expression/action）
+            candidates = [
+                i for i, row in enumerate(rows)
+                if any(_tag_dimension(item) in
+                       ("outfit", "hair", "eyes", "expression", "action", "gaze")
+                       for item in row)
+            ]
+            if index < len(candidates):
+                char_row = candidates[index]
+            if char_row is None:
+                rows.append([tag])
+            else:
+                rows[char_row].insert(0, tag)
+            appended += 1
+        if appended:
+            payload = info if isinstance(info, dict) else {}
+            payload.setdefault("trigger_injected", []).extend(missing)
+        return _join_lines(rows)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"_force_character_triggers 异常（保持原样）：{type(exc).__name__}: {exc}")
+        return positive
+
+
+def _drop_bare_character_ids(positive, tag_map=None):
+    """同一角色同时出现「库标准全名」和「裸 id」时，删掉裸 id（v15.6）。
+
+    LLM 有时会同时写 `sparkle, sparkle_(honkai:_star_rail)`。
+    裸 `sparkle` 在库里是 general「闪光」（228739 posts），
+    和角色名一起送去出图会污染画面。保留全名、丢掉裸 id。
+    """
+    try:
+        pairs = []
+        for cid, tag in (tag_map or {}).items():
+            bare = _s(cid)
+            full = _s(tag)
+            if bare and full and _norm_tag_key(bare) != _norm_tag_key(full):
+                pairs.append((_norm_tag_key(bare), _norm_tag_key(full)))
+        if not pairs:
+            return positive, []
+        rows = _split_lines(positive)
+        present = {_norm_tag_key(item) for row in rows for item in row}
+        doomed = {bare for bare, full in pairs
+                  if bare in present and full in present}
+        if not doomed:
+            return positive, []
+        dropped = []
+        kept_rows = []
+        for row in rows:
+            kept = []
+            for item in row:
+                if _norm_tag_key(item) in doomed:
+                    dropped.append(_s(item))
+                    continue
+                kept.append(item)
+            if kept:
+                kept_rows.append(kept)
+        if not dropped:
+            return positive, []
+        return _join_lines(kept_rows), dropped
+    except Exception:  # noqa: BLE001
+        return positive, []
+
+
+def _escape_brackets(positive, info=None):
+    """把标签里的字面括号转义成 ``\\(`` ``\\)``（v15）。
+
+    依据（lead 在 ComfyUI 源码里验证）：``comfy/sd1_clip.py`` 的
+    ``escape_important`` 会在 ``parse_parentheses`` **之前**把 ``\\(`` ``\\)``
+    换成占位符，``unescape_important`` 分词后再还原成字面括号。
+    所以转义后：既不会被当权重语法，CLIP 又能收到正确的 ``castorice_(honkai:_star_rail)``。
+
+    **不动**：合法权重语法 ``(smile:1.2)``、常规颜文字 ``^_^``、已转义的标签。
+    """
+    changed = []
+    try:
+        rows = _split_lines(positive)
+        if not rows:
+            return positive, changed
+        for row in rows:
+            for index, tag in enumerate(row):
+                text = _s(tag)
+                if not text:
+                    continue
+                if "(" not in text and ")" not in text:
+                    continue
+                if _CANONICAL_WEIGHT_RE.match(text):
+                    continue
+                if text.lower().strip() in _BRACKET_SAFE_EMOTICONS:
+                    continue
+                if "\\(" in text or "\\)" in text:
+                    continue
+                escaped = text.replace("(", "\\(").replace(")", "\\)")
+                row[index] = escaped
+                changed.append({"from": text, "to": escaped})
+        if not changed:
+            return positive, changed
+        payload = info if isinstance(info, dict) else {}
+        payload.setdefault("bracket_escaped", []).extend(changed)
+        return _join_lines(rows), changed
+    except Exception as exc:  # noqa: BLE001
+        _log(f"_escape_brackets 异常（保持原样）：{type(exc).__name__}: {exc}")
+        return positive, changed
+
+
+def _sanitize_brackets(positive, character_ids, info=None, tag_map=None):
+    """护栏：把带括号的角色触发词还原成**纯 id**（v14）。
+
+    圆括号在 ComfyUI / A1111 的 prompt 语法里表示权重分组，
+    ``castorice_(honkai:_star_rail)`` 会被解析成「对 castorice_ 加权」+「对冒号内容加权」，
+    等于把角色名拆坏 —— 这是会直接导致出图错误的硬 bug。
+
+    处理范围**只限角色触发词形态**的标签（去括号后的基础名匹配某个角色 id），
+    常规标签（含表情符号、权重语法）一律不动。
+
+    :returns: ``(new_positive, changed)``
+    """
+    changed = []
+    try:
+        if not character_ids:
+            return positive, changed
+        rows = _split_lines(positive)
+        if not rows:
+            return positive, changed
+        lowered_ids = {_s(cid).lower(): _s(cid) for cid in character_ids if _s(cid)}
+        id_bases = {_trigger_base(cid): _s(cid) for cid in character_ids if _s(cid)}
+        # v15.3：裸角色 id -> 库标准 tag。
+        # LLM 可能直接输出 `castorice`（纯 id），纯 id 在库里 NOT FOUND，
+        # 来源校验又因为它在用户原文里而放行 —— 结果画不出来。必须补全成全名。
+        id_to_tag = {}
+        for cid, tag in (tag_map or {}).items():
+            key = _norm_tag_key(cid)
+            target = _s(tag)
+            if key and target and _norm_tag_key(target) != key:
+                id_to_tag[key] = target
+        for row in rows:
+            for index, tag in enumerate(row):
+                text = _s(tag)
+                if not text:
+                    continue
+                plain_key = _norm_tag_key(text)
+                if plain_key in id_to_tag:
+                    target_tag = id_to_tag[plain_key]
+                    changed.append({"from": text, "to": target_tag})
+                    row[index] = target_tag
+                    continue
+                if not _BRACKET_RE.search(text):
+                    continue
+                if text.lower().strip() in _BRACKET_SAFE_EMOTICONS:
+                    continue
+                # 保留权重语法 (tag:1.2)
+                if _CANONICAL_WEIGHT_RE.match(text):
+                    continue
+                base = _trigger_base(text)
+                if not base:
+                    continue
+                target = None
+                if base in id_bases:
+                    target = id_bases[base]
+                else:
+                    for alias, cid in lowered_ids.items():
+                        alias_base = _trigger_base(alias)
+                        if alias_base and (base == alias_base or base.startswith(alias_base)):
+                            target = cid
+                            break
+                if target:
+                    changed.append({"from": text, "to": target})
+                    row[index] = target
+        if not changed:
+            return positive, changed
+        payload = info if isinstance(info, dict) else {}
+        payload.setdefault("bracket_sanitized", []).extend(changed)
+        return _join_lines(rows), changed
+    except Exception as exc:  # noqa: BLE001
+        _log(f"_sanitize_brackets 异常（保持原样）：{type(exc).__name__}: {exc}")
+        return positive, changed
 
 
 def _restructure_rows(rows):
@@ -3304,7 +4001,11 @@ def _enforce_cn_segments(rows, cn_mapped, info, ui=None):
     # **多角色时跳过**：像「一个穿白裙一个穿黑裙」这种两套服装要留给 LLM
     # 分配到各自的角色行，代码强行合并会两边都穿同一件。
     character = cn_mapped.get("character") or ()
-    if character and not _is_multi_character_ui(ui):
+    # v14.2：优先用「最终角色数」（含正文识别），其次回退到 ui 行数
+    _final_count = info.get("final_character_count")
+    _multi = (_final_count > 1) if isinstance(_final_count, int) \
+        else _is_multi_character_ui(ui)
+    if character and not _multi:
         index = None
         for row_index, row in enumerate(rows):
             if any(_tag_dimension(tag) in
@@ -3920,6 +4621,8 @@ def _rewrite_only(llm, natural_language, ui, data=None, core=None):
     prompt_options = _prompt_options()
 
     # ---- 本次注入约束（契约 §14.2 校验输入）
+    # v15.7：required_tokens 用**未转义**的标准 tag；
+    # 括号转义的差异由 skill_check._bare_tag 统一剥掉（双向对齐，见该函数注释）。
     required_tokens = list(core["debug"].get("injected_triggers") or [])
     forbidden_tokens = list(
         (core["debug"].get("negative_suppress_source") or {}).get("outfit") or []
