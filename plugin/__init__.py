@@ -36,6 +36,8 @@ _EXPECTED_NODES = (
     # v2 合并版保留（旧工作流兼容），语义上等价于 GGUF+云端 切换
     ("NL2PromptLoadLLM", "加载LLM（旧·本地/云端合一）"),
     ("NL2PromptLoRAStack", "LoRA 堆栈加载"),
+    # 单卡友好：出图后把模型从显存卸掉，腾给本地 LLM
+    ("NL2PromptUnloadModels", "卸载所有模型（NL2Prompt）"),
 )
 
 #: v2 旧类名 → v3 新类名。

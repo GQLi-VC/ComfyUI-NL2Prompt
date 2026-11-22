@@ -5837,3 +5837,18 @@ except ImportError:  # 裸导入（单测 ``sys.path.insert(0, plugin); import n
         _log(f"nodes_llm 不可用：{type(exc).__name__}: {exc}")
 except Exception as exc:  # noqa: BLE001
     _log(f"nodes_llm 不可用：{type(exc).__name__}: {exc}")
+
+# --------------------------------------------------------------------------- 卸载模型节点
+# 单卡用户跑完出图后卸掉显存里的模型，把显存让给本地 LLM。
+# 与 nodes_llm 一样：单独文件 + 这里 re-export，让 __init__.py 照旧从
+# nodes 模块取到类；缺失/损坏只打日志，不影响其它节点。
+
+try:  # 包内导入（ComfyUI 正常路径）
+    from .nodes_unload import NL2PromptUnloadModels  # noqa: F401
+except ImportError:  # 裸导入（单测 sys.path.insert(0, plugin); import nodes）
+    try:
+        from nodes_unload import NL2PromptUnloadModels  # type: ignore  # noqa: F401
+    except Exception as exc:  # noqa: BLE001
+        _log(f"nodes_unload 不可用：{type(exc).__name__}: {exc}")
+except Exception as exc:  # noqa: BLE001
+    _log(f"nodes_unload 不可用：{type(exc).__name__}: {exc}")
