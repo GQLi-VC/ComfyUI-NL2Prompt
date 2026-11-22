@@ -296,6 +296,483 @@ _PUNCT_NORMALIZE = {
     "？": " ",
 }
 
+# ===========================================================================
+# v13：长句场景扩展（按类别组织，便于长期追加）
+# ===========================================================================
+# 设计说明：
+#   * 组合词（颜色 + 品类）优先，一条命中就同时给「颜色标签 + 款式标签」
+#   * 短词也单独收录，用户说「穿着一袭长裙」时由最长优先自动回退
+#   * 只收**确定性可翻译**的中文，不收录开放集合（具体动作细节交给 LLM）
+#   * 段归属：服装/表情/动作/发饰 -> character 行；天气/器物/场景/画风 -> scene 行
+
+_CN_V13 = {}
+
+
+def _put(category, segment, mapping):
+    """把一个类别的中文->英文映射并入总表。"""
+    for zh, tags in mapping.items():
+        if isinstance(tags, str):
+            tags = (tags,)
+        if segment == SEGMENT_SCENE:
+            entry = _s(*tags)
+        elif segment == SEGMENT_FRAMING:
+            entry = _f(*tags)
+        elif segment == SEGMENT_QUALITY:
+            entry = _q(*tags)
+        else:
+            entry = _c(*tags)
+        # 已有条目优先（前面的表是手工精调过的），扩展只补空缺
+        _CN_V13.setdefault(zh, entry)
+
+
+# ---------------------------------------------------------------- 服装品类
+#: 品类 -> (英文核心名词, 附加标签...)
+_CANON_GARMENT = {
+    "长裙": ("dress", ("long dress",)),
+    "短裙": ("skirt", ("short skirt",)),
+    "连衣裙": ("dress", ()),
+    "裙子": ("skirt", ()),
+    "礼服": ("dress", ("evening gown",)),
+    "晚礼服": ("dress", ("evening gown",)),
+    "衬衫": ("shirt", ()),
+    "T恤": ("t-shirt", ()),
+    "上衣": ("top", ()),
+    "外套": ("coat", ()),
+    "大衣": ("coat", ("long coat",)),
+    "风衣": ("coat", ("trench coat",)),
+    "西装": ("suit", ()),
+    "夹克": ("jacket", ()),
+    "皮夹克": ("jacket", ("leather jacket",)),
+    "毛衣": ("sweater", ()),
+    "卫衣": ("hoodie", ()),
+    "牛仔裤": ("jeans", ()),
+    "长裤": ("pants", ()),
+    "短裤": ("shorts", ()),
+    "百褶裙": ("skirt", ("pleated skirt",)),
+    "吊带裙": ("dress", ("sundress",)),
+    "蕾丝裙": ("dress", ("lace",)),
+    "校服": ("uniform", ("school uniform",)),
+    "制服": ("uniform", ()),
+    "和服": ("kimono", ()),
+    "旗袍": ("china dress", ()),
+    "汉服": ("hanfu", ()),
+    "泳装": ("swimsuit", ()),
+    "泳衣": ("swimsuit", ()),
+    "比基尼": ("bikini", ()),
+    "睡衣": ("pajamas", ()),
+    "女仆装": ("maid outfit", ()),
+    "盔甲": ("armor", ()),
+    "战袍": ("armor", ("battle dress",)),
+    "围巾": ("scarf", ()),
+    "斗篷": ("cape", ()),
+    "披风": ("cape", ()),
+    "手套": ("gloves", ()),
+    "过膝袜": ("thighhighs", ()),
+    "长袜": ("thighhighs", ()),
+    "丝袜": ("pantyhose", ()),
+    "高跟鞋": ("high heels", ()),
+    "靴子": ("boots", ()),
+    "帽子": ("hat", ()),
+    "贝雷帽": ("beret", ()),
+    "草帽": ("straw hat", ()),
+}
+
+for _zh, _pair in _CANON_GARMENT.items():
+    _core, _extra = _pair
+    _put("outfit", SEGMENT_CHARACTER, {_zh: (_core,) + tuple(_extra)})
+
+# ---------------------------------------------------------------- 服装颜色
+#: 服装用的颜色词（注意不是发色：金色在衣服上写 gold，头发才是 blonde）
+_CANON_OUTFIT_COLOR = {
+    "黑色": "black",
+    "白色": "white",
+    "红色": "red",
+    "蓝色": "blue",
+    "绿色": "green",
+    "紫色": "purple",
+    "粉色": "pink",
+    "黄色": "yellow",
+    "灰色": "grey",
+    "棕色": "brown",
+    "银色": "silver",
+    "金色": "gold",
+}
+
+#: 参与「颜色 + 品类」展开的高频品类（避免生成 silver_jeans 这类怪组合）
+_CANON_COLORABLE = ("长裙", "短裙", "连衣裙", "裙子", "衬衫", "外套", "礼服", "泳装")
+
+#: 单独收录的常见颜色裙装简称（用户常说「白裙」「黑裙」）
+_CANON_COLOR_SHORT = {
+    "黑裙": "black",
+    "白裙": "white",
+    "红裙": "red",
+    "蓝裙": "blue",
+    "紫裙": "purple",
+    "粉裙": "pink",
+}
+
+# v13.1（lead 复核）：**只给一个主标签**。
+# 中文里「白裙」最常指连衣裙；同时给 dress + skirt 等于让模型画一件
+# 既是连衣裙又是半身裙的衣服（自相矛盾）。要半身裙的用户会说
+# 「百褶裙」「短裙」「半身裙」，那些词有各自的映射。
+for _zh, _en in _CANON_COLOR_SHORT.items():
+    _put("outfit", SEGMENT_CHARACTER, {_zh: ("%s %s" % (_en, "dress"),)})
+
+for _cn_color, _en_color in _CANON_OUTFIT_COLOR.items():
+    for _cn_item in _CANON_COLORABLE:
+        _core, _extra = _CANON_GARMENT[_cn_item]
+        _tags = ["%s %s" % (_en_color, _core)] + list(_extra)
+        _put("outfit", SEGMENT_CHARACTER, {_cn_color + _cn_item: tuple(_tags)})
+
+# ---------------------------------------------------------------- 表情
+_put("expression", SEGMENT_CHARACTER, {
+    "忧郁": ("sad",),
+    "悲伤": ("sad",),
+    "难过": ("sad",),
+    "失落": ("sad",),
+    "开心": ("happy",),
+    "高兴": ("happy",),
+    "愉快": ("happy",),
+    "快乐": ("happy",),
+    "害羞": ("blush",),
+    "脸红": ("blush",),
+    "羞涩": ("blush",),
+    "生气": ("angry",),
+    "愤怒": ("angry",),
+    "恼怒": ("angry",),
+    "惊讶": ("surprised",),
+    "吃惊": ("surprised",),
+    "震惊": ("surprised",),
+    "微笑": ("smile",),
+    "轻轻微笑": ("smile",),
+    "笑着": ("smile",),
+    "浅笑": ("smile",),
+    "大笑": ("grin",),
+    "笑容": ("smile",),
+    "流泪": ("tears",),
+    "眼泪": ("tears",),
+    "哭泣": ("crying",),
+    "哭": ("crying",),
+    "皱眉": ("frown",),
+    "蹙眉": ("frown",),
+    "闭眼": ("closed eyes",),
+    "闭着眼睛": ("closed eyes",),
+    "张嘴": ("open mouth",),
+    "面无表情": ("expressionless",),
+    "无表情": ("expressionless",),
+    "得意": ("smug",),
+    "嘟嘴": ("pout",),
+    "尴尬": ("embarrassed",),
+    "疑惑": ("confused",),
+    "沉思": ("thinking",),
+    "认真": ("serious",),
+    "温柔": ("gentle",),
+})
+
+# ---------------------------------------------------------------- 天气 / 光线
+_put("weather", SEGMENT_SCENE, {
+    "雨": ("rain",),
+    "下雨": ("rain",),
+    "雨天": ("rain",),
+    "雨中": ("rain",),
+    "大雨": ("heavy rain",),
+    "毛毛雨": ("drizzle",),
+    "雨滴": ("rain",),
+    "雨点": ("rain",),
+    "雪花": ("snow",),
+    "雪": ("snow",),
+    "下雪": ("snow",),
+    "雪天": ("snow",),
+    "晴天": ("day", "sunlight"),
+    "晴朗": ("day", "sunlight"),
+    "阳光明媚": ("sunlight", "day"),
+    "阳光": ("sunlight",),
+    "日光": ("sunlight",),
+    "晨光": ("morning light",),
+    "阴天": ("cloudy",),
+    "多云": ("cloudy",),
+    "乌云": ("cloudy",),
+    "黄昏": ("sunset", "golden hour"),
+    "傍晚": ("sunset", "golden hour"),
+    "日落": ("sunset",),
+    "夕阳": ("sunset",),
+    "日出": ("sunrise",),
+    "黎明": ("dawn",),
+    "拂晓": ("dawn",),
+    "夜晚": ("night",),
+    "夜里": ("night",),
+    "深夜": ("night",),
+    "夜空": ("night",),
+    "星空": ("starry sky",),
+    "星星": ("stars",),
+    "月光": ("moonlight",),
+    "月亮": ("moon",),
+    "逆光": ("backlighting",),
+    "侧光": ("sidelighting",),
+    "柔光": ("soft lighting",),
+    "昏暗": ("dim lighting",),
+    "阴暗": ("dim lighting",),
+    "明亮": ("bright",),
+    "烛光": ("candlelight",),
+    "烛火": ("candlelight",),
+    "霓虹": ("neon lights",),
+    "霓虹灯": ("neon lights",),
+    "风景": ("scenery",),
+    "彩虹": ("rainbow",),
+    "闪电": ("lightning",),
+    "打雷": ("thunder",),
+    "风": ("wind",),
+    "微风": ("wind",),
+    "风吹": ("wind",),
+    "大风": ("wind",),
+    "雾气": ("fog",),
+    "薄雾": ("fog",),
+    "浓雾": ("fog",),
+    "水汽": ("steam",),
+})
+
+# ---------------------------------------------------------------- 器物 / 道具
+_put("prop", SEGMENT_SCENE, {
+    "玻璃": ("glass",),
+    "窗户": ("window",),
+    "窗外": ("window",),
+    "窗口": ("window",),
+    "窗边": ("window",),
+    "玻璃窗": ("window",),
+    "窗帘": ("curtain",),
+    "伞": ("umbrella",),
+    "雨伞": ("umbrella",),
+    "花": ("flower",),
+    "花朵": ("flower",),
+    "花瓣": ("flower petals",),
+    "花束": ("bouquet",),
+    "书": ("book",),
+    "书本": ("book",),
+    "杯子": ("cup",),
+    "咖啡杯": ("coffee cup",),
+    "茶": ("tea",),
+    "镜子": ("mirror",),
+    "灯": ("lamp",),
+    "灯光": ("lamp",),
+    "街灯": ("streetlight",),
+    "路灯": ("streetlight",),
+    "蜡烛": ("candle",),
+    "水珠": ("water drop",),
+    "水洼": ("puddle",),
+    "积水": ("puddle",),
+    "反光": ("reflection",),
+    "倒影": ("reflection",),
+    "树叶": ("leaf",),
+    "落叶": ("falling leaves",),
+    "火焰": ("fire",),
+    "烟雾": ("smoke",),
+    "剑": ("sword",),
+    "手机": ("phone",),
+    "相机": ("camera",),
+    "耳机": ("headphones",),
+    "沙发": ("sofa",),
+    "床": ("bed",),
+    "地毯": ("carpet",),
+    "楼梯": ("stairs",),
+    "樱花": ("cherry blossoms",),
+    "树叶飘落": ("falling leaves",),
+})
+
+# ---------------------------------------------------------------- 动作 / 姿态
+_put("action", SEGMENT_CHARACTER, {
+    "回头": ("looking back",),
+    "回头看": ("looking back",),
+    "站立": ("standing",),
+    "站着": ("standing",),
+    "坐着": ("sitting",),
+    "坐下": ("sitting",),
+    "躺下": ("lying",),
+    "躺着": ("lying",),
+    "奔跑": ("running",),
+    "跑": ("running",),
+    "行走": ("walking",),
+    "走路": ("walking",),
+    "散步": ("walking",),
+    "漫步": ("walking",),
+    "挥手": ("waving",),
+    "招手": ("waving",),
+    "拥抱": ("hug",),
+    "抱住": ("hug",),
+    "牵手": ("holding hands",),
+    "牵着手": ("holding hands",),
+    "跳跃": ("jumping",),
+    "跳起": ("jumping",),
+    "蹲下": ("squatting",),
+    "蹲着": ("squatting",),
+    "倚靠": ("leaning",),
+    "靠在": ("leaning",),
+    "仰望": ("looking up",),
+    "抬头": ("looking up",),
+    "低头": ("looking down",),
+    "俯视": ("looking down",),
+    "看着镜头": ("looking at viewer",),
+    "看向镜头": ("looking at viewer",),
+    "望向镜头": ("looking at viewer",),
+    "看着远方": ("looking afar",),
+    "望向远方": ("looking afar",),
+    "转身": ("turning around",),
+    "伸手": ("reaching out",),
+    "抱着手臂": ("crossed arms",),
+    "双手叉腰": ("hands on hips",),
+    "托腮": ("hand to own cheek",),
+    "摸头发": ("hand in own hair",),
+    "整理头发": ("hand in own hair",),
+    "拿着": ("holding",),
+    "抱着": ("holding",),
+    "看书": ("reading",),
+    "读书": ("reading",),
+    "思索": ("thinking",),
+})
+
+# ---------------------------------------------------------------- 场景 / 地点
+_put("scene", SEGMENT_SCENE, {
+    "教室": ("classroom",),
+    "学校": ("school",),
+    "校园": ("school",),
+    "街道": ("street",),
+    "街头": ("street",),
+    "城市": ("city",),
+    "都市": ("city",),
+    "小巷": ("alley",),
+    "胡同": ("alley",),
+    "公园": ("park",),
+    "房间": ("room",),
+    "屋子": ("room",),
+    "室内": ("indoors",),
+    "户外": ("outdoors",),
+    "室外": ("outdoors",),
+    "海边": ("beach", "ocean"),
+    "海滩": ("beach", "ocean"),
+    "沙滩": ("beach",),
+    "海边沙滩": ("beach", "ocean"),
+    "森林": ("forest",),
+    "树林": ("forest",),
+    "山顶": ("mountain",),
+    "山上": ("mountain",),
+    "山中": ("mountain",),
+    "图书馆": ("library",),
+    "咖啡厅": ("cafe",),
+    "咖啡馆": ("cafe",),
+    "餐厅": ("restaurant",),
+    "车站": ("station",),
+    "地铁站": ("subway station",),
+    "走廊": ("hallway",),
+    "阳台": ("balcony",),
+    "卧室": ("bedroom",),
+    "厨房": ("kitchen",),
+    "浴室": ("bathroom",),
+    "泳池": ("pool",),
+    "游泳池": ("pool",),
+    "河流": ("river",),
+    "河边": ("river", "water"),
+    "湖": ("lake",),
+    "湖边": ("lake",),
+    "湖面": ("lake",),
+    "沙漠": ("desert",),
+    "雪地": ("snow",),
+    "天空": ("sky",),
+    "蓝天": ("sky", "blue sky"),
+    "云": ("cloud",),
+    "云层": ("cloud",),
+    "医院": ("hospital",),
+    "教堂": ("church",),
+    "城堡": ("castle",),
+    "废墟": ("ruins",),
+    "庭院": ("garden",),
+    "花园": ("garden",),
+    "田野": ("field",),
+    "花田": ("flower field",),
+    "花海": ("flower field",),
+    "地板": ("floor",),
+    "墙壁": ("wall",),
+    "天花板": ("ceiling",),
+    "门口": ("doorway",),
+    "舞台": ("stage",),
+    "天台": ("rooftop",),
+    "屋顶": ("rooftop",),
+    "工厂": ("factory",),
+    "废墟城市": ("ruins", "city"),
+    "神社": ("shrine",),
+    "寺庙": ("temple",),
+    "城堡内部": ("castle", "indoors"),
+})
+
+# ---------------------------------------------------------------- 画风
+_put("style", SEGMENT_SCENE, {
+    "水彩": ("watercolor",),
+    "水彩画": ("watercolor",),
+    "油画": ("oil painting",),
+    "赛璐璐": ("cel shading",),
+    "厚涂": ("thick paint",),
+    "线稿": ("lineart",),
+    "像素风": ("pixel art",),
+    "电影感": ("cinematic",),
+    "复古": ("retro",),
+    "写实": ("realistic",),
+    "动漫": ("anime",),
+    "插画": ("illustration",),
+    "素描": ("sketch",),
+    "水墨": ("ink painting",),
+    "水墨画": ("ink painting",),
+    "漫画": ("manga",),
+    "手绘": ("hand drawn",),
+    "极简": ("minimalist",),
+    "唯美风格": ("beautiful",),
+    "黑白": ("monochrome",),
+    "单色": ("monochrome",),
+})
+
+# ---------------------------------------------------------------- 角色属性
+_put("attribute", SEGMENT_CHARACTER, {
+    "长发": ("long hair",),
+    "长头发": ("long hair",),
+    "短发": ("short hair",),
+    "短头发": ("short hair",),
+    "双马尾": ("twintails",),
+    "单马尾": ("ponytail",),
+    "马尾辫": ("ponytail",),
+    "马尾": ("ponytail",),
+    "卷发": ("curly hair",),
+    "直发": ("straight hair",),
+    "刘海": ("bangs",),
+    "呆毛": ("ahoge",),
+    "辫子": ("braid",),
+    "麻花辫": ("braid",),
+    "丸子头": ("hair bun",),
+    "眼镜": ("glasses",),
+    "耳环": ("earrings",),
+    "耳饰": ("earrings",),
+    "项链": ("necklace",),
+    "发饰": ("hair ornament",),
+    "发带": ("hairband",),
+    "兽耳": ("animal ears",),
+    "猫耳": ("cat ears",),
+    "天使翅膀": ("angel wings",),
+    "翅膀": ("wings",),
+    "尾巴": ("tail",),
+})
+
+# ---------------------------------------------------------------- 视距补充
+_put("shot", SEGMENT_FRAMING, {
+    "近景": ("close-up",),
+    "中近景": ("upper body",),
+    "大远景": ("very wide shot",),
+    "全身立绘": ("full body",),
+    "半身像": ("upper body",),
+    "脸部特写": ("close-up",),
+    "眼神特写": ("close-up", "eyes",),
+})
+
+#: 把扩展表并入总表（手工精调过的条目优先，扩展只补空缺）
+for _zh, _entry in _CN_V13.items():
+    CN_TAG_MAP.setdefault(_zh, _entry)
+
+
 #: 按长度倒序的短语表（最长匹配优先）
 _SORTED_PHRASES = sorted(CN_TAG_MAP, key=len, reverse=True)
 

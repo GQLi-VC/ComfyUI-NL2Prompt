@@ -1871,6 +1871,10 @@ def _compose_core(natural_language, ui, data=None):
     #  v10 改成先映射、再只保留剩余英文，避免中文进到分段结构里）
     leftover = cn_mapped.get("remaining") or ""
     leftover_raw = leftover
+    # v13：未被映射的中文片段**不静默丢弃** —— 透出给用户看「这句我识别不了哪部分」
+    _zh_left = " ".join(re.findall(r"[\u4e00-\u9fff]{2,}", leftover_raw))
+    if _zh_left.strip():
+        debug["zh_unmapped"] = _zh_left.strip()
     leftover_clean = strip_cjk_segments(leftover).strip() if leftover.strip() else ""
     leftover_all_cjk = False
     if leftover_clean != leftover_raw.strip() and leftover_raw.strip():
@@ -2750,6 +2754,24 @@ def _norm_tag_key(tag):
         return ""
 
 
+#: 允许「用户提到过该维度 + 共享词元」就放行的维度（v13 长句适配）。
+#:
+#: **故意不含 hair / eyes**：这两个是角色固有属性，一旦维度级放行，
+#: 「一个蓝发少女」就会冒出 long_hair / twintails / colored_inner_hair ——
+#: 这正是 lead 的 B 用例在守的底线。
+#: 注意：**故意不含 outfit**（v13.1，lead 方案 C）。
+#:
+#: outfit 是编造重灾区 —— LLM 会把「白裙」细化成 `white_dress, white_skirt,
+#: pleated_skirt`，连衣裙和半身裙同时出现是硬伤。而「共享词元」这条规则
+#: 区分不了 ``wet_street``（合理推断）和 ``pleated_skirt``（纯编造）：
+#: 两者结构一样（共享名词 + 一个修饰词）。
+#: 所以服装**只认 cn_tags 映射 + 角色库白名单**，LLM 多加的 outfit 细节一律删。
+_ELABORATABLE_DIMENSIONS = frozenset((
+    "scene", "action", "expression", "lighting", "shot",
+    "count", "gaze", "quality",
+))
+
+
 def _tag_dimension(tag):
     """把标签归到受控维度；归不进去返回 ``""``（视为自由标签）。
 
@@ -3147,6 +3169,11 @@ def _enforce_tag_sources(positive, core, natural_language, ui, cn_mapped):
         if not rows:
             return positive, info
         allow = _template_allowlist(core)
+        # v13：扫描出的英文标签的**全部词元**，用于「维度豁免」的交集判断
+        mention_tokens = set()
+        for _seg_key in ("quality", "framing", "character", "scene"):
+            for _tag in (cn_mapped.get(_seg_key) or ()):
+                mention_tokens.update(_norm_tag_key(_tag).split())
         # v12：性别表由模板路径算好放在 core.debug 里，供人数推断使用
         core_debug = core.get("debug") if isinstance(core, dict) else {}
         if isinstance(core_debug, dict) and isinstance(
@@ -3177,14 +3204,27 @@ def _enforce_tag_sources(positive, core, natural_language, ui, cn_mapped):
                 # long_hair / twintails / colored_inner_hair。只有白名单（角色库、
                 # 风格库、中文映射、质量默认、模板里的用户英文）和用户原文英文词元
                 # 才算有来源。这样「一个蓝发少女」不会冒出任何编造标签。
+                # v13：维度豁免（长句适配）。
+                # 条件（三条全满足才放行，比早期宽泛版严、比全删版宽）：
+                #   1. 该维度属于可细化维度（**hair / eyes 永不放行** ——
+                #      「一个蓝发少女」不能冒出 long_hair）
+                #   2. 中文扫描在该维度上**有实体**
+                #   3. 标签与扫描出的英文标签**共享至少一个词元**
+                #      （扫描有 street，允许 wet_street；扫描没有 classroom，就不许凭空加）
                 dim = _tag_dimension(tag)
+                words = set(key.split())
+                if (dim and dim in _ELABORATABLE_DIMENSIONS
+                        and dim in mentioned and (words & mention_tokens)):
+                    kept.append(tag)
+                    info["tag_sources"][key] = "user_text_zh"
+                    continue
                 reason = "unmentioned_%s" % (dim or "free_tag")
                 info["dropped"].append({"tag": tag, "reason": reason})
             if kept:
                 kept_rows.append(kept)
 
         # 补回确定性映射里 LLM 漏掉的标签（按段归位）
-        enforced = _enforce_cn_segments(kept_rows, cn_mapped, info)
+        enforced = _enforce_cn_segments(kept_rows, cn_mapped, info, ui)
         rows = enforced
 
         # 角色数量补齐（结构第 2 行要求有）
@@ -3234,7 +3274,7 @@ def _append_to_row(rows, index, tags, sources, info):
     return rows
 
 
-def _enforce_cn_segments(rows, cn_mapped, info):
+def _enforce_cn_segments(rows, cn_mapped, info, ui=None):
     """修 1：中文映射命中的标签**强制出现**在最终 positive 里（按段归位）。"""
     sources = info["tag_sources"]
     quality = cn_mapped.get("quality") or ()
@@ -3259,7 +3299,32 @@ def _enforce_cn_segments(rows, cn_mapped, info):
     if scene:
         index = _find_segment_row(rows, "scene")
         rows = _append_to_row(rows, index, scene, sources, info)
+    # v13：character 段（表情/动作/发色/服装）也要补 —— 之前漏了，
+    # 导致「散步」映射出的 walking 命中却不进 positive（lead 实测长句 2）。
+    # **多角色时跳过**：像「一个穿白裙一个穿黑裙」这种两套服装要留给 LLM
+    # 分配到各自的角色行，代码强行合并会两边都穿同一件。
+    character = cn_mapped.get("character") or ()
+    if character and not _is_multi_character_ui(ui):
+        index = None
+        for row_index, row in enumerate(rows):
+            if any(_tag_dimension(tag) in
+                   ("outfit", "hair", "eyes", "expression", "action", "gaze")
+                   for tag in row):
+                index = row_index
+                break
+        rows = _append_to_row(rows, index, character, sources, info)
     return rows
+
+
+def _is_multi_character_ui(ui):
+    """UI 里是否选了**多个**角色（多角色时服装映射要留给 LLM 分配）。"""
+    try:
+        config = _normalize_ui(ui)
+        count = sum(1 for row in config["character_rows"]
+                    if _s(row.get("trigger")))
+        return count > 1
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _infer_character_count(ui, gender_map=None):

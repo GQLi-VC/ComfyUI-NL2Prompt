@@ -46,19 +46,19 @@
   "checker": "anima_v1",
   "examples": [
     {
-      "input": "自然语言：让她穿一件黑色长裙，站在紫色花海中，半身构图\n已选：角色 castorice（遐蝶），服装 原皮（紫裙：strapless dress, purple dress, frilled dress, detached collar, detached sleeves, purple sleeves）",
-      "positive": "masterpiece, best quality\n1girl, solo, cowboy_shot\ncastorice, purple_hair, colored_inner_hair, twintails, purple_eyes, pointy_ears, black_dress, long_dress, standing, looking_at_viewer\nflower_field, purple_flower, soft lighting",
-      "negative": "worst quality, low quality, lowres, blurry, bad anatomy, bad hands, watermark, signature, strapless dress, purple dress, frilled dress, detached collar, detached sleeves, purple sleeves, white background, indoors"
+      "input": "自然语言：一个穿着黑色长裙的少女站在雨夜的霓虹街头，回头微笑，长发被风吹起",
+      "positive": "masterpiece, best quality, highres\n1girl, solo\nblack_dress, long_dress, long_hair, looking_back, smile\nrainy_night, night, neon_lights, street, wind",
+      "negative": "worst quality, low quality, lowres, blurry, bad anatomy, bad hands, extra digits, watermark, signature, english text, day, sunlight, indoors"
     },
     {
-      "input": "自然语言：白发少女穿黑色长风衣，站在霓虹雨夜的赛博街头，全身，电影感。\n已选：服装 long coat（black coat）；画师 @wlop",
-      "positive": "masterpiece, best quality\n1girl, solo, full_body\nwhite_hair, long_hair, black_coat, long_coat, standing\nnight, city, neon_lights, rain, wet, street, puddle, reflection, from_below, backlighting, sidelighting, lens_flare, depth_of_field, @wlop",
-      "negative": "worst quality, low quality, lowres, blurry, jpeg artifacts, bad anatomy, bad hands, extra digits, watermark, signature, english text, day, sunlight, indoors"
+      "input": "自然语言：高清画质的全身照，两个女角色在公园里散步，一个穿白裙一个穿黑裙，阳光明媚",
+      "positive": "masterpiece, best quality, highres\n2girls, full_body\ngirl_a, walking, white_dress\ngirl_b, walking, black_dress\npark, sunlight, day",
+      "negative": "worst quality, low quality, lowres, blurry, bad anatomy, bad hands, extra digits, watermark, signature, english text, night, indoors, rain"
     },
     {
-      "input": "自然语言：画一个蓝发双马尾的少女，穿我选的白衬衫校服，放学后站在教室窗边看向镜头，傍晚暖光，半身构图。\n已选：角色 hatsune miku；服装 serafuku（white shirt, sailor collar, pleated skirt）",
-      "positive": "masterpiece, best quality\n1girl, solo, cowboy_shot\nhatsune_miku, blue_hair, twintails, serafuku, white_shirt, sailor_collar, pleated_skirt, necktie, standing, looking_at_viewer\nclassroom, window, indoors, from_side, golden_hour, sunlight, depth_of_field",
-      "negative": "worst quality, low quality, lowres, blurry, jpeg artifacts, bad anatomy, bad hands, extra digits, watermark, signature, english text, bikini, swimsuit, maid outfit"
+      "input": "自然语言：特写镜头，蓝发少女眼神忧郁地看着窗外，雨滴打在玻璃上，昏暗的室内",
+      "positive": "masterpiece, best quality, highres\n1girl, solo, close-up\nblue_hair, sad, looking_away\nindoors, window, glass, rain, dim_lighting",
+      "negative": "worst quality, low quality, lowres, blurry, bad anatomy, bad hands, extra digits, watermark, signature, english text, outdoors, sunlight"
     }
   ],
   "analysis_hint": "用一句中文告诉用户这一轮补全或调整了什么（服装、构图、光照），例如「补了半身构图与傍晚暖光，按所选校服锁定服装标签」。不要复述标签，硬上限 100 字（宁短勿长，40 字以内最好）。"
