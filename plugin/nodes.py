@@ -3287,6 +3287,102 @@ def _rename_debug_keys(tag_sources, dropped, cn_enforced, rename):
     return new_sources, new_dropped, new_enforced
 
 
+def _assign_outfit_rows(positive, natural_language, role_infos, info=None):
+    """多角色时按「每个角色自己的那一段原文」纠正 outfit 标签归属（v16.4）。
+
+    为什么需要：``cn_tags`` 的 character 段是按**整句**映射的，不知道
+    「黑色长裙」是胡桃的还是可莉的；LLM 也可能写错。而
+    ``_character_text_segment`` 早就实现了「按角色名切段」，只是之前只用于
+    ``detect_outfit_override``（预设服装），没作用到 cn_tags 的产出上。
+
+    算法（lead 指定）：
+      1. 每个角色用 ``_character_text_segment`` 切出自己的那一段原文；
+      2. 每段各自 ``translate()``，取其 ``character`` 段里 **outfit 维度**的标签；
+      3. positive 里归属错的 outfit 标签 → 移到对应角色行；
+      4. 无法判断归属（该 tag 不在任何角色段里）→ 保持原位不动。
+
+    :param role_infos: ``[{"tag": 库标准tag, "alias": 命中别名}, ...]``
+    """
+    try:
+        if not isinstance(role_infos, list) or len(role_infos) < 2:
+            return positive, []
+        text_body = str(natural_language or "")
+        if not text_body.strip():
+            return positive, []
+
+        translate = _translate_cn
+
+        aliases_all = [_s(item.get("alias")) for item in role_infos if _s(item.get("alias"))]
+
+        # ---- 1) 每段各自翻译，收集「该角色应有哪些 outfit 标签」
+        role_outfits = []       # [(role_tag, {norm_key: original_tag})]
+        for item in role_infos:
+            alias = _s(item.get("alias"))
+            role_tag = _s(item.get("tag"))
+            if not alias or not role_tag:
+                role_outfits.append((role_tag, {}))
+                continue
+            segment = _character_text_segment(text_body, alias, aliases_all)
+            others = [a for a in aliases_all if a != alias]
+            seg_result = translate(segment)
+            outfit_map = {}
+            for tag in (seg_result.get("character") or ()):
+                if _tag_dimension(tag) != "outfit":
+                    continue
+                key = _norm_tag_key(tag)
+                if key:
+                    outfit_map[key] = tag
+            # 该角色段里若完全没有 outfit，说明这段没写服装 —— 保持空
+            role_outfits.append((role_tag, outfit_map))
+            _ = others
+
+        # 归属表：norm_key -> 它应该属于的角色 tag
+        owner = {}
+        for role_tag, outfit_map in role_outfits:
+            for key in outfit_map:
+                owner.setdefault(key, role_tag)
+        if not owner:
+            return positive, []
+
+        # ---- 2) 重新分配
+        rows = _split_lines(positive)
+        if not rows:
+            return positive, []
+        tag_to_row = {}
+        role_row_index = {}
+        for index, row in enumerate(rows):
+            for tag in row:
+                tag_to_row[_norm_tag_key(tag)] = index
+            for tag in row:
+                if _norm_tag_key(tag) in {_norm_tag_key(r[0]) for r in role_outfits}:
+                    role_row_index[_norm_tag_key(tag)] = index
+
+        if len(role_row_index) < 2:
+            return positive, []
+
+        moved = []
+        for key, owner_tag in owner.items():
+            current = tag_to_row.get(key)
+            target = role_row_index.get(_norm_tag_key(owner_tag))
+            if current is None or target is None or current == target:
+                continue
+            raw_tag = rows[current][
+                [_norm_tag_key(t) for t in rows[current]].index(key)]
+            rows[current] = [t for t in rows[current] if _norm_tag_key(t) != key]
+            rows[target].append(raw_tag)
+            moved.append(raw_tag)
+
+        rows = [row for row in rows if row]
+        if not moved:
+            return positive, []
+        if isinstance(info, dict):
+            info["outfit_reassigned"] = list(moved)
+        return _join_lines(rows), moved
+    except Exception as exc:  # noqa: BLE001 - 归属纠正失败保持原样
+        _log(f"_assign_outfit_rows 异常（保持原样）：{type(exc).__name__}: {exc}")
+        return positive, []
+
+
 def _finalize_positive(positive, tagdb_debug, core, natural_language, ui):
     """positive 定稿前的统一收尾（首轮与重试共用，v12）。
 
@@ -3324,6 +3420,35 @@ def _finalize_positive(positive, tagdb_debug, core, natural_language, ui):
     positive = _force_character_triggers(
         positive, core_debug.get("active_character_tags"), info,
         core_debug.get("character_tag_map"))
+
+    # v16.4：多角色 **outfit 归属纠正**。
+    # 「胡桃穿黑色长裙，可莉穿红色外套」时，cn_tags 按整句映射、
+    # LLM 也可能写错，导致 red_coat 跑到胡桃行。这里按角色名切段重新分配。
+    try:
+        _role_infos = []
+        for _item in (core_debug.get("tagdb_roles") or ()):
+            _tag = _s(_item.get("tag"))
+            _alias = _s(_item.get("matched"))
+            if _tag and _alias:
+                _role_infos.append({"tag": _tag, "alias": _alias})
+        if len(_role_infos) < 2:
+            # 退回 characters.json 路径的配对信息
+            _names = list(core_debug.get("characters_from_text") or ())
+            _matches = list(core_debug.get("characters_from_text_match") or ())
+            _tags = list(core_debug.get("active_character_tags") or ())
+            if len(_names) >= 2 and len(_matches) >= 2 and len(_tags) >= 2:
+                for _i in range(min(len(_matches), len(_tags))):
+                    _alias = _s(_matches[_i])
+                    _tag = _s(_tags[_i])
+                    if _alias and _tag:
+                        _role_infos.append({"tag": _tag, "alias": _alias})
+        if len(_role_infos) >= 2:
+            positive, _moved = _assign_outfit_rows(
+                positive, natural_language, _role_infos, info)
+            if _moved:
+                info["outfit_reassigned"] = list(_moved)
+    except Exception as exc:  # noqa: BLE001 - 归属纠正失败绝不拖垮出图
+        _log(f"outfit 归属纠正跳过：{type(exc).__name__}: {exc}")
 
     name_info = {}
     positive, rename_map = _normalize_tag_names(
@@ -3928,8 +4053,67 @@ def _sanitize_brackets(positive, character_ids, info=None, tag_map=None):
         return positive, changed
 
 
-def _restructure_rows(rows):
-    """按「正面提示词结构」**强制重排**各段（v11）。
+#: 多角色被合并到同一行时，这些维度的标签算「共享动作」——
+#: 它描述的是两人之间的关系，挪到第 2 行才符合「每人一行」的结构。
+#: hair / eyes / outfit 是角色个人特征，无法判断归属，留在第一个角色行。
+_SHARED_ACTION_DIMENSIONS = ("action", "gaze", "expression")
+
+
+def _split_multi_character_rows(character_rows, character_tags, framing):
+    """把「多个角色挤在同一行」拆成每人一行（v16.2）。
+
+    lead 实测：``2girls`` 与两个角色 tag 同一行时，模型**只画一个人**
+    （它把两个 tag 当成同一角色的多种写法）。所以必须拆开。
+
+    行内的共享动作（action/gaze/expression）描述的是「两人之间的关系」，
+    挪到第 2 行；hair/eyes/outfit 是个人特征、无法判断归属，留在第一个角色行。
+
+    :param framing: 第 2 行标签列表，**原地追加**共享动作。
+    """
+    try:
+        char_keys = {_norm_tag_key(tag) for tag in (character_tags or ()) if _s(tag)}
+        char_keys.discard("")
+        if len(char_keys) < 2:
+            return character_rows
+
+        out = []
+        shared_actions = []
+        for row in character_rows or ():
+            tags_in_row = [tag for tag in row if _norm_tag_key(tag) in char_keys]
+            if len(tags_in_row) < 2:
+                out.append(row)
+                continue
+            personal = []
+            shared = []
+            for tag in row:
+                if _norm_tag_key(tag) in char_keys:
+                    continue
+                if _tag_dimension(tag) in _SHARED_ACTION_DIMENSIONS:
+                    shared.append(tag)
+                else:
+                    personal.append(tag)
+            for index, char_tag in enumerate(tags_in_row):
+                if index == 0 and personal:
+                    out.append([char_tag] + personal)
+                else:
+                    out.append([char_tag])
+            shared_actions.extend(shared)
+
+        if shared_actions:
+            existing = {_norm_tag_key(tag) for tag in framing if _s(tag)}
+            for tag in shared_actions:
+                key = _norm_tag_key(tag)
+                if key and key not in existing:
+                    existing.add(key)
+                    framing.append(tag)
+        return out
+    except Exception as exc:  # noqa: BLE001 - 拆分失败保持原样，绝不拖垮出图
+        _log(f"_split_multi_character_rows 异常（保持原样）：{type(exc).__name__}: {exc}")
+        return character_rows
+
+
+def _restructure_rows(rows, character_tags=None):
+    """按「正面提示词结构」**强制重排**各段（v11 / v16.2）。
 
     LLM 常把场景标签塞进角色行（``smile, blue_hair, city, street, night``），
     不符合「场景画风单独一行」。这里按标签维度重新分组：
@@ -3941,6 +4125,14 @@ def _restructure_rows(rows):
 
     多角色时角色行的**行数与相对顺序**保持不变（每行一个角色），只把场景和
     质量标签抽走，所以不会把两个角色并到一行。
+
+    v16.2：LLM 仍可能把两个角色塞进同一行
+    （``klee_(genshin_impact), hu_tao_(genshin_impact), holding_hands, walking``），
+    实测这种结构会让模型**只画一个人**。这里用 ``character_tags`` 主动识别并
+    **强制拆成每人一行**，行内共享动作挪到第 2 行。
+
+    :param character_tags: 本次参与角色的库标准 tag（``active_character_tags``）。
+        为空时不做拆分（保持 v11 行为）。
     """
     try:
         quality, framing, scene = [], [], []
@@ -3964,12 +4156,19 @@ def _restructure_rows(rows):
                     quality.append(tag)
                 elif dimension in ("count", "shot"):
                     framing.append(tag)
-                elif dimension == "scene":
+                # v16.3：lighting 是**场景属性**（见「正面提示词结构」的场景行
+                # = scene -> camera -> lighting -> style），不该留在角色行。
+                # 之前 `golden_hour` 被塞进 `klee_..., holding_hands, golden_hour`。
+                elif dimension in ("scene", "lighting"):
                     scene.append(tag)
                 else:
                     keep.append(tag)
             if keep:
                 character_rows.append(keep)
+        # v16.2：多角色强制每人一行（必须在 framing 定稿前做，共享动作要并进第 2 行）
+        character_rows = _split_multi_character_rows(
+            character_rows, character_tags, framing)
+
         ordered = []
         if quality:
             ordered.append(quality)
@@ -4059,7 +4258,8 @@ def _enforce_tag_sources(positive, core, natural_language, ui, cn_mapped):
         if not rows:
             return positive, info
         # 按「正面提示词结构」重排：质量 / 视距+人数 / 每角色一行 / 场景
-        rows = _restructure_rows(rows)
+        rows = _restructure_rows(
+            rows, (core.get("debug") or {}).get("active_character_tags"))
         info["lines"] = len(rows)
         return _join_lines(rows), info
     except Exception as exc:  # noqa: BLE001 - 来源校验失败绝不拖垮出图
@@ -4720,6 +4920,14 @@ def _call_llm_once(
     return positive, negative, analysis, extra, parsed
 
 
+#: ``_compose_core`` 的 debug 里有几项会被 LLM 路径重新计算或以 tagdb 为准，
+#: 不能无脑覆盖（否则「最终值」会被模板值盖掉）。
+_CORE_DEBUG_SKIP = frozenset({
+    "tag_sources", "dropped", "cn_enforced", "lines", "used_llm",
+    "fallback", "detail", "mode", "elapsed_ms", "skill_check",
+})
+
+
 def _rewrite_only(llm, natural_language, ui, data=None, core=None):
     """**只做 LLM 重写**的完整链路（供 ``compose_with_llm`` 与 ``/nl2prompt/rewrite`` 共用）。
 
@@ -4960,11 +5168,25 @@ def _rewrite_only(llm, natural_language, ui, data=None, core=None):
     # 用户排查「我的中文怎么不见了」时需要看得见。
     _core_debug = core.get("debug") if isinstance(core, dict) else {}
     if isinstance(_core_debug, dict):
-        for _key in ("cjk_cleaned", "cjk_removed_chars", "cjk_fallback",
-                     "outfit_override", "cn_mapped", "cn_dropped",
-                     "quality_default", "count_inferred"):
-            if _key in _core_debug:
-                debug[_key] = _core_debug[_key]
+        # v16.3：改成**黑名单透传**。
+        # 这里原来是手写字段白名单（只有 8 个 key），每加一个观测字段就要改一遍，
+        # 结果角色相关的 6 个字段（final_character_count / characters_from_text /
+        # tagdb_roles / role_source / active_character_tags / character_tag_map）
+        # 全部没带到 /rewrite 的响应里 —— 而 tag_sources 里明明有 "enforced"，
+        # 证明识别与注入都跑通了，只是 debug 没带回去。
+        # 这与 routes.py 的 debug 白名单是**同一个反模式**，这次彻底改成黑名单。
+        for _key, _value in _core_debug.items():
+            if str(_key).startswith("_"):
+                continue
+            if _key in debug:
+                continue          # LLM 路径自己算的值优先（如 segment_lines）
+            if _key in _CORE_DEBUG_SKIP:
+                continue          # tag_sources / dropped 等以 tagdb_debug 为准
+            try:
+                json.dumps(_value, ensure_ascii=False)
+            except (TypeError, ValueError):
+                continue
+            debug[_key] = _value
     # 覆盖兜底的信息在 tagdb_debug 里更全（含 garment_supplemented），优先用它
     if isinstance(tagdb_debug, dict) and isinstance(
             tagdb_debug.get("outfit_override"), dict):

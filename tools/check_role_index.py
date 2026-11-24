@@ -167,6 +167,48 @@ def main():
           not role_index.scan_roles_in_text("一个少女站在雨夜的街头"),
           str(role_index.scan_roles_in_text("一个少女站在雨夜的街头")))
 
+    section("8b. 泛称不得识别成角色（lead 实测的 inkling 误伤）")
+    for probe in ("两个女角色在公园里散步", "一个男角色站在海边",
+                  "三个人物在房间里", "一个女孩站在树下"):
+        hits = role_index.scan_roles_in_text(probe)
+        check("「%s」不产生角色" % probe, not hits,
+              str([h['tag'] for h in hits]))
+    # 真实角色名仍要正常识别
+    hits = role_index.scan_roles_in_text("胡桃在璃月港散步")
+    check("泛称排除不影响真实角色", hits and hits[0]['tag'] == 'hu_tao_(genshin_impact)',
+          str([h['tag'] for h in hits]))
+
+    section("8c. 多角色强制每人一行（2girls 不能与两个角色 tag 同行）")
+    # 直接测 _restructure_rows：模拟 LLM 把两个角色挤进一行
+    _rows = [['best quality'], ['2girls'],
+             ['klee_(genshin_impact)', 'hu_tao_(genshin_impact)',
+              'holding_hands', 'walking'],
+             ['street', 'sunset']]
+    _tags = ['klee_(genshin_impact)', 'hu_tao_(genshin_impact)']
+    _out = nodes._restructure_rows([list(r) for r in _rows], _tags)
+    _joined = [', '.join(r) for r in _out]
+    _char_lines = [line for line in _joined
+                   if 'genshin_impact' in line]
+    check("两个角色被拆成两行", len(_char_lines) == 2, str(_char_lines))
+    check("每行只有一个角色 tag",
+          all(line.count('genshin_impact') == 1 for line in _char_lines),
+          str(_char_lines))
+    _second = _joined[1] if len(_joined) > 1 else ''
+    check("共享动作 holding_hands 挪到第 2 行", 'holding_hands' in _second, _second)
+    check("共享动作 walking 挪到第 2 行", 'walking' in _second, _second)
+    check("第 2 行仍有人数 2girls", '2girls' in _second, _second)
+    check("角色行不再带共享动作",
+          not any('holding_hands' in line or 'walking' in line
+                  for line in _char_lines), str(_char_lines))
+
+    # 单人行为不变
+    _rows1 = [['best quality'], ['1girl'],
+              ['hu_tao_(genshin_impact)', 'walking'], ['street']]
+    _out1 = nodes._restructure_rows([list(r) for r in _rows1], _tags)
+    _j1 = [', '.join(r) for r in _out1]
+    check("单人：角色行仍保留自己的动作",
+          any('hu_tao_(genshin_impact), walking' in line for line in _j1), str(_j1))
+
     section("9. 性能")
     import time
     text = "胡桃和流萤在璃月港的街道上散步，黄昏时分，夕阳把街道染成橘红色"

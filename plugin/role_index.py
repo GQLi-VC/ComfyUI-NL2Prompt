@@ -40,6 +40,18 @@ ROLE_MIN_POSTS = 2000
 #: 中英文分界：这些字符不算英文单词字符
 _WORD_BOUNDARY = set(" \t\n,.;:!?()[]{}<>\"'`~@#$%^&*-=+|/\\")
 
+#: 中文**泛称**：这些词描述「有几个人」，不指定「是谁」。
+#: 但它们在库里有对应的长尾角色 tag —— 例如「角色」会命中
+#: ``inkling_player_character``（Splatoon 玩家角色），导致输出里凭空多出一个人。
+#: 这是 lead 实测出的真实误伤：输入「两个女角色在公园里散步」，
+#: 第 3 行冒出 ``inkling_player_character, walking, black_dress``。
+_ZH_COMMON_WORDS = (
+    "角色", "女角色", "男角色", "人物", "女性", "男性",
+    "女孩", "男孩", "女生", "男生", "少女", "少年",
+    "女子", "男子", "妹子", "小姐姐", "人们", "人类",
+    "一个", "两个", "三个", "一个人", "两个人", "三个人",
+)
+
 #: 英文常见「时间 / 天气 / 颜色 / 方位」词。这些词几乎总有某个角色 tag 拿它当名字
 #: （``dusk_(arknights)``、``neon_(nikke)``…），但它们在长句里几乎总是场景描述。
 #: ``cn_tags`` 的中文键能盖掉大部分，英文侧再用这张小表兜底。
@@ -74,7 +86,7 @@ def _load_exclude_sets():
     global _EXCLUDE
     if _EXCLUDE is not None:
         return _EXCLUDE
-    zh_keys = set()
+    zh_keys = set(_ZH_COMMON_WORDS)
     en_keys = set(_EN_COMMON_WORDS)
     try:
         from . import cn_tags as _cn_tags  # 包内导入

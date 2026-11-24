@@ -216,6 +216,86 @@ def _error_en_for(code):
     return ""
 
 
+#: v16.1：``debug`` 字段透出改成**黑名单模式**。
+#:
+#: 历史上是手写白名单，每加一个观测字段都要同步改一遍 —— 已经漏了 5 次
+#: （``tagdb`` / ``cjk_cleaned`` / ``tag_sources`` / ``role_source`` /
+#: ``final_character_count``）。漏了的表现是「debug 里明明有值，但 /rewrite
+#: 返回 None」，排查成本极高。
+#:
+#: 现在默认透传整个 debug，只剔除敏感字段与内部字段，以后加字段零维护。
+_DEBUG_BLOCKLIST = frozenset({
+    "api_key", "apikey", "api_key_id", "token", "access_token", "refresh_token",
+    "secret", "client_secret", "password", "credential", "credentials",
+    "llm", "llm_config", "config", "provider", "base_url", "headers",
+})
+#: 以这些前缀开头的 key 属于内部实现，不透出
+_DEBUG_DENY_PREFIX = ("_", "llm_", "raw_")
+
+
+def _build_debug_payload(debug, skill_check=None, negative_missing=None,
+                         retried=False, tagdb_view=None):
+    """把内层 ``debug`` 转成 ``/rewrite`` 的响应 debug 块（黑名单透传）。
+
+    显式字段保证前端契约不破（``skill_check`` / ``tag_sources`` 等老字段形状不变），
+    其余字段**全量透传**，只剔除 ``_DEBUG_BLOCKLIST`` 与内部前缀。
+    """
+    debug = debug if isinstance(debug, dict) else {}
+    tagdb_view = tagdb_view if isinstance(tagdb_view, dict) else {}
+    if not isinstance(skill_check, dict):
+        skill_check = debug.get("skill_check")
+    payload = {
+        "used_llm": bool(debug.get("used_llm", True)),
+        "skill_check": skill_check,
+        "quality": debug.get("quality"),
+        "fallback": str(debug.get("fallback") or ""),
+        "retried": bool(retried or (skill_check or {}).get("retried")),
+        "negative_missing": list(negative_missing or []),
+        # 标签库归一结果：用户必须能看到哪些标签被改写，否则改动是隐形的
+        "tagdb": debug.get("tagdb") if isinstance(debug.get("tagdb"), dict) else None,
+        # 多行分段（v11）：行数、中文映射命中、被删的无来源标签
+        "segment_lines": debug.get("segment_lines"),
+        "cn_mapped": debug.get("cn_mapped") or [],
+        "quality_default": bool(debug.get("quality_default")),
+        # 标签来源校验：用户排查"为什么某个标签不见了"时需要
+        "tag_sources": tagdb_view.get("tag_sources") or
+                       (debug.get("tagdb") or {}).get("tag_sources") or {},
+        "dropped": tagdb_view.get("dropped") or
+                   (debug.get("tagdb") or {}).get("dropped") or [],
+        "cn_enforced": tagdb_view.get("cn_enforced") or
+                       (debug.get("tagdb") or {}).get("cn_enforced") or [],
+        "prompt_opt": debug.get("prompt_opt") if isinstance(debug.get("prompt_opt"), dict) else None,
+        # 中文清理
+        "cjk_cleaned": debug.get("cjk_cleaned"),
+        "cjk_removed_chars": debug.get("cjk_removed_chars"),
+        # 换装覆盖
+        "outfit_override": debug.get("outfit_override") if isinstance(debug.get("outfit_override"), dict) else None,
+        # v16 角色识别
+        "role_source": debug.get("role_source"),
+        "tagdb_roles": debug.get("tagdb_roles") or [],
+        "characters_from_text": debug.get("characters_from_text") or [],
+        "character_tag_map": debug.get("character_tag_map") or {},
+        "active_character_tags": debug.get("active_character_tags") or [],
+        "final_character_count": debug.get("final_character_count"),
+        "zh_unmapped": debug.get("zh_unmapped"),
+    }
+
+    # ---- 黑名单透传：其余字段自动带上，以后新增 debug 字段零维护
+    for key, value in debug.items():
+        if key in payload:
+            continue
+        if key in _DEBUG_BLOCKLIST:
+            continue
+        if str(key).startswith(_DEBUG_DENY_PREFIX):
+            continue
+        try:
+            json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError):
+            continue          # 不可 JSON 序列化的内部对象直接跳过
+        payload[key] = value
+    return payload
+
+
 def _error(code, detail="", detail_en="", **extra):
     """统一错误体（v3：双语）。
 
@@ -970,11 +1050,10 @@ async def _handle_rewrite(request):
         code = str(result.get("error") or "llm_error")
         detail = str(result.get("detail") or "")[:200]
         # 校验失败时把 issues 带给前端（契约 §14.2）
-        debug_payload = {
-            key: value
-            for key, value in (result.get("debug") or {}).items()
-            if key in ("skill_check", "quality", "analysis", "retried")
-        }
+        # v16.1：与成功分支一致，改成**黑名单透传**（见 _build_debug_payload）
+        debug_payload = _build_debug_payload(
+            result.get("debug") or {}, None, [], bool((result.get("debug") or {}).get("retried"))
+        )
         # 走 _error 才能拿到 detail_zh / detail_en（code 由 nodes 决定，
         # 例如 cloud_model_empty / llm_key_missing / llm_timeout）
         return _error(code, detail, debug=debug_payload)
@@ -994,38 +1073,7 @@ async def _handle_rewrite(request):
         "positive": result.get("positive", ""),
         "negative": result.get("negative", ""),
         "analysis": result.get("analysis", ""),
-        "debug": {
-            "used_llm": bool(debug.get("used_llm", True)),
-            "skill_check": skill_check,
-            "quality": debug.get("quality"),
-            "fallback": str(debug.get("fallback") or ""),
-            "retried": retried,
-            "negative_missing": negative_missing,
-            # 标签库归一结果：用户必须能看到哪些标签被改写，否则改动是隐形的
-            "tagdb": debug.get("tagdb") if isinstance(debug.get("tagdb"), dict) else None,
-            # 多行分段（v11）：行数、中文映射命中、被删的无来源标签
-            "segment_lines": debug.get("segment_lines"),
-            "cn_mapped": debug.get("cn_mapped") or [],
-            "quality_default": bool(debug.get("quality_default")),
-            # 标签来源校验：用户排查"为什么某个标签不见了"时需要
-            "tag_sources": _dbg_tagdb.get("tag_sources") or {},
-            "dropped": _dbg_tagdb.get("dropped") or [],
-            "cn_enforced": _dbg_tagdb.get("cn_enforced") or [],
-            # 本次生效的 token 优化开关，便于排查"为什么没有省 token"
-            "prompt_opt": debug.get("prompt_opt") if isinstance(debug.get("prompt_opt"), dict) else None,
-            # 中文清理：用户排查"为什么我的中文不见了"时需要
-            "cjk_cleaned": debug.get("cjk_cleaned"),
-            "cjk_removed_chars": debug.get("cjk_removed_chars"),
-            # 换装覆盖：用户排查"为什么原来的衣服没了/还在"时需要
-            "outfit_override": debug.get("outfit_override") if isinstance(debug.get("outfit_override"), dict) else None,
-            # v16 角色识别来源：用户需要区分「本地 Lora 角色」和「tagdb 角色索引认出来的」
-            "role_source": debug.get("role_source"),
-            "tagdb_roles": debug.get("tagdb_roles") or [],
-            # 正文识别到的角色（含来自 characters.json 与 tagdb 两条路径）
-            "characters_from_text": debug.get("characters_from_text") or [],
-            # 未映射的中文片段：用户排查「这句话哪里没识别」
-            "zh_unmapped": debug.get("zh_unmapped"),
-        },
+        "debug": _build_debug_payload(debug, skill_check, negative_missing, retried, _dbg_tagdb),
     }
 
 
