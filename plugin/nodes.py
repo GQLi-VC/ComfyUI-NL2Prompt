@@ -1687,6 +1687,26 @@ def _compose_core(natural_language, ui, data=None):
         ]
     # v14：所有角色纯 id（括号护栏用）
     character_ids = _collect_character_ids(view)
+    # v16：tagdb 角色的标准 tag 也要受括号护栏保护，否则 `hu_tao_(genshin_impact)`
+    # 会被当成非法括号删掉。
+    _tagdb_tags = [
+        _s(row.get("trigger")) for row in text_rows
+        if _s(row.get("_role_source")) == "tagdb_role_index" and _s(row.get("trigger"))
+    ]
+    if _tagdb_tags:
+        character_ids = list(character_ids) + [tag for tag in _tagdb_tags
+                                               if tag not in character_ids]
+        debug["role_source"] = "tagdb_role_index"
+        debug["tagdb_roles"] = [
+            {
+                "tag": _s(row.get("trigger")),
+                "matched": _s(row.get("_matched_alias")),
+                "posts": row.get("_tagdb_posts"),
+                "ambiguous": bool(row.get("_tagdb_ambiguous")),
+            }
+            for row in text_rows
+            if _s(row.get("_role_source")) == "tagdb_role_index"
+        ]
     debug["character_ids"] = list(character_ids)
     # v14.2：**最终**角色数（含正文识别的）—— 多角色时服装映射要留给 LLM 分配
     debug["final_character_count"] = sum(
@@ -1710,12 +1730,20 @@ def _compose_core(natural_language, ui, data=None):
     for _row in all_rows:
         if not _s(_row.get("trigger")):
             continue
+        # v16：tagdb 角色没有 characters.json 条目，它的 trigger 已经是库标准 tag
+        if _s(_row.get("_role_source")) == "tagdb_role_index":
+            _tagdb_tag = _s(_row.get("trigger"))
+            if _tagdb_tag:
+                _active_tags.append(_tagdb_tag)
+                character_tag_map[_trigger_base(_tagdb_tag)] = _tagdb_tag
+            continue
         _char = view.resolve_character(_s(_row.get("name"))) \
             if _s(_row.get("name")) else None
         _tag = _resolve_character_tag(_char) if _char else ""
         if _tag:
             _active_tags.append(_tag)
     debug["active_character_tags"] = _active_tags
+    debug["character_tag_map"] = dict(character_tag_map)
 
     # v12：角色性别表（供人数推断；characters.json 的 gender 字段）
     gender_map = {}
@@ -1984,6 +2012,16 @@ def _compose_core(natural_language, ui, data=None):
     leftover_raw = leftover
     # v13：未被映射的中文片段**不静默丢弃** —— 透出给用户看「这句我识别不了哪部分」
     _zh_left = " ".join(re.findall(r"[\u4e00-\u9fff]{2,}", leftover_raw))
+    # v16：**已识别的角色名不算「未映射」** —— 它们已经被角色索引处理成 tag 了，
+    # 留在 zh_unmapped 里只会让用户以为「胡桃没认出来」。
+    try:
+        for _row in text_rows:
+            _alias = _s(_row.get("_matched_alias"))
+            if _alias and _alias in _zh_left:
+                _zh_left = _zh_left.replace(_alias, " ")
+    except Exception:  # noqa: BLE001
+        pass
+    _zh_left = " ".join(_zh_left.split())
     if _zh_left.strip():
         debug["zh_unmapped"] = _zh_left.strip()
     leftover_clean = strip_cjk_segments(leftover).strip() if leftover.strip() else ""
@@ -3071,7 +3109,16 @@ _TRUSTED_LOOKUP_VIA = frozenset(("exact", "alias"))
 _CANONICAL_MIN_POSTS = 100
 
 
-def _lookup_canonical(tag):
+#: v16-B 性能：``_lookup_canonical`` 的进程内缓存。
+#: 一次 ``tagdb.lookup`` 可能要跑 FTS 甚至全库 fuzzy（实测单次 300ms+），
+#: 而一次 ``_compose_core`` 会为每个场景标签查一次 —— 长句识别出 8 个标签
+#: 就是 8 次查库，直接让单句耗时从 0.8ms 涨到 120ms。
+#: 标签 -> 标准名的映射是静态数据，缓存永远安全。
+_CANONICAL_CACHE = {}
+_CANONICAL_CACHE_LIMIT = 20000
+
+
+def _lookup_canonical_raw(tag):
     """查库拿标准名；查不到 / 不可信 / 使用量过低时返回空串（调用方保持原样）。"""
     if _tagdb_mod is None:
         return ""
@@ -3098,6 +3145,27 @@ def _lookup_canonical(tag):
         return _s(result.get("name"))
     except Exception:  # noqa: BLE001
         return ""
+
+
+def _lookup_canonical(tag):
+    """``_lookup_canonical_raw`` 的进程内缓存包装。
+
+    为什么必须缓存：``tagdb.lookup`` 在命中不了前几级时会跑 FTS 甚至**全库 fuzzy**
+    （实测单次 300ms+）。长句识别出的场景标签从 1 个涨到 8 个后，单句就要查库
+    七八次 —— 实测 ``_compose_core`` 从 0.8ms 退化到 120ms。
+    标签 -> 标准名的映射是静态数据，缓存没有正确性风险。
+    """
+    try:
+        key = _norm_tag_key(tag)
+    except Exception:  # noqa: BLE001
+        return _lookup_canonical_raw(tag)
+    if key in _CANONICAL_CACHE:
+        return _CANONICAL_CACHE[key]
+    value = _lookup_canonical_raw(tag)
+    if len(_CANONICAL_CACHE) > _CANONICAL_CACHE_LIMIT:
+        _CANONICAL_CACHE.clear()
+    _CANONICAL_CACHE[key] = value
+    return value
 
 
 def _normalize_tag_names(positive, info=None, skip_keys=None):
@@ -3371,8 +3439,6 @@ def _scan_characters_in_text(natural_language, view, existing_rows, data=None):
             return added
         catalog = view.catalog() or {}
         characters = _dicts(catalog.get("characters"))
-        if not characters:
-            return added
 
         existing_keys = set()
         for row in (existing_rows or ()):
@@ -3409,11 +3475,74 @@ def _scan_characters_in_text(natural_language, view, existing_rows, data=None):
                 "outfit_hint": "",
                 "_from_text": True,
                 "_matched_alias": hit,
+                "_role_source": "characters_json",
             })
+
+        # v16：characters.json 没命中时，再查 tagdb 角色索引（36k 热门游戏角色）。
+        # 这类角色**没有 activation_words / outfit / lora**，只有标准 tag 本身，
+        # 所以只注入角色 tag，绝不编造发色瞳色服装（见 role_index 模块注释）。
+        added.extend(_scan_tagdb_roles(text, existing_rows, added))
         return added
     except Exception as exc:  # noqa: BLE001
         _log(f"_scan_characters_in_text 异常（跳过正文识别）：{type(exc).__name__}: {exc}")
         return added
+
+
+def _scan_tagdb_roles(text, existing_rows, already_added):
+    """从 tagdb 角色索引里识别长句中的热门游戏角色（v16）。
+
+    与 ``characters.json`` 的区别：这里只有「名字 -> 标准 tag」，
+    **没有** activation_words / outfit / lora_name，因此：
+
+    * 只把角色 tag 本身注入 positive（``hu_tao_(genshin_impact)``）；
+    * 不注入任何特征标签（不编造发色瞳色服装）；
+    * ``_role_source = "tagdb_role_index"``，debug 里能看出它不是本地 Lora。
+    """
+    rows = []
+    try:
+        try:
+            from . import role_index as _role_index
+        except ImportError:
+            import role_index as _role_index  # type: ignore
+
+        hits = _role_index.scan_roles_in_text(text)
+        if not hits:
+            return rows
+
+        taken = set()
+        for row in list(existing_rows or ()) + list(already_added or ()):
+            for field in ("name", "trigger", "id"):
+                value = _norm(row.get(field))
+                if value:
+                    taken.add(value)
+        known_tags = {
+            _norm_tag_key(row.get("trigger")) for row in (already_added or ())
+        }
+
+        for hit in hits:
+            tag = _s(hit.get("tag"))
+            if not tag or _norm_tag_key(tag) in known_tags:
+                continue
+            # 用户已经在 UI 里选过这个角色（按 tag 或别名判重）
+            if _norm(tag) in taken or _norm(_trigger_base(tag)) in taken:
+                continue
+            known_tags.add(_norm_tag_key(tag))
+            rows.append({
+                "id": "tagdb_" + tag,
+                "name": _s(hit.get("matched")) or tag,
+                "trigger": tag,                     # 库标准 tag（含括号，后续统一转义）
+                "outfit_hint": "",
+                "_from_text": True,
+                "_matched_alias": _s(hit.get("matched")),
+                "_role_source": "tagdb_role_index",
+                "_tagdb_posts": hit.get("posts"),
+                "_tagdb_ambiguous": bool(hit.get("ambiguous")),
+            })
+        return rows
+    except Exception as exc:  # noqa: BLE001 - 索引坏了必须降级，不能断出图
+        _log(f"_scan_tagdb_roles 异常（跳过 tagdb 角色识别）："
+             f"{type(exc).__name__}: {exc}")
+        return rows
 
 
 def _character_text_segment(natural_language, matched_alias, other_aliases):

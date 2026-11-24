@@ -1018,6 +1018,13 @@ async def _handle_rewrite(request):
             "cjk_removed_chars": debug.get("cjk_removed_chars"),
             # 换装覆盖：用户排查"为什么原来的衣服没了/还在"时需要
             "outfit_override": debug.get("outfit_override") if isinstance(debug.get("outfit_override"), dict) else None,
+            # v16 角色识别来源：用户需要区分「本地 Lora 角色」和「tagdb 角色索引认出来的」
+            "role_source": debug.get("role_source"),
+            "tagdb_roles": debug.get("tagdb_roles") or [],
+            # 正文识别到的角色（含来自 characters.json 与 tagdb 两条路径）
+            "characters_from_text": debug.get("characters_from_text") or [],
+            # 未映射的中文片段：用户排查「这句话哪里没识别」
+            "zh_unmapped": debug.get("zh_unmapped"),
         },
     }
 
