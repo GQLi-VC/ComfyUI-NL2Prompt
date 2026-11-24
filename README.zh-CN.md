@@ -20,6 +20,24 @@
 
 ---
 
+## Character tags and your checkpoint
+
+The plugin resolves character names to **Danbooru standard tags** (e.g. 胡桃 → `hu_tao_\(genshin_impact\)`), and a built-in index covers **36,410 characters** from popular games (Genshin, Honkai: Star Rail, Arknights, Azur Lane, Blue Archive, Zenless Zone Zero, Umamusume, and more).
+
+**But whether a character actually appears depends on your checkpoint.** A tag can only work if the model was trained on that character:
+
+| Checkpoint | Result for `hu_tao_\(genshin_impact\)` |
+|---|---|
+| `animagine-xl-4.0` (Danbooru-trained) | Renders Hu Tao correctly (hat, twin tails, black coat) |
+| `anima-preview3-base` (Qwen CLIP) | Tag is ignored; a generic girl is drawn |
+
+If you need a specific character to appear reliably, add it to `plugin/data/characters.json` with a **LoRA** — the plugin then injects the LoRA plus its full set of feature tags. The Danbooru index is for characters your model already knows.
+
+Two more notes on model limits (not plugin bugs):
+
+- **Multiple characters often render as one.** SDXL-family models have a strong single-subject bias. Adding explicit spatial relations, generating separately, or using Regional Prompter helps.
+- **Outfit swaps keep the character's signature look.** When the character's trained appearance is strong, negatives can only suppress concrete garment tags; the model still fills in kimono/uniform elements.
+
 ## 1. 它解决什么问题
 
 ComfyUI 里画一张「对的」图，通常要做三件事：**想提示词、拼 LoRA 触发词、拉一堆连线的编码节点**。这三件事都很碎：
